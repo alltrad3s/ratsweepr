@@ -1,0 +1,185 @@
+# RatSweepr
+
+```
+██████╗  █████╗ ████████╗███████╗██╗    ██╗███████╗███████╗██████╗ ██████╗
+██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██║    ██║██╔════╝██╔════╝██╔══██╗██╔══██╗
+██████╔╝███████║   ██║   ███████╗██║ █╗ ██║█████╗  █████╗  ██████╔╝██████╔╝
+██╔══██╗██╔══██║   ██║   ╚════██║██║███╗██║██╔══╝  ██╔══╝  ██╔═══╝ ██╔══██╗
+██║  ██║██║  ██║   ██║   ███████║╚███╔███╔╝███████╗███████╗██║     ██║  ██║
+╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚══╝╚══╝ ╚══════╝╚══════╝╚═╝     ╚═╝  ╚═╝
+```
+
+**WordPress malware scanner & cleanup assistant for shared hosting.**
+No root. No agent. No deletions — ever.
+
+RatSweepr ships in two flavors that share the same detection logic, report
+format, signature files, and `~/.ratsweepr` home:
+
+| | Go / TUI (recommended) | Bash (fallback) |
+|---|---|---|
+| File | `ratsweepr` binary (Releases) | `ratsweepr.sh` |
+| Interface | Bubble Tea TUI + headless CLI | menu + CLI |
+| Needs on server | nothing (static binary) | bash, curl/wget, coreutils; php-cli & mysql client for full coverage |
+| DB scan | built-in MySQL driver | via WP-CLI or `mysql` client |
+| Use when | almost always | host mounts `$HOME` noexec, or you want zero-install |
+
+## Quick start
+
+**Go/TUI version** (installer detects arch and verifies sha256):
+
+```bash
+cd ~/public_html    # your WordPress root — where wp-config.php lives
+bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/install.sh)
+./ratsweepr         # TUI
+./ratsweepr scan    # headless / cron
+```
+
+**Bash version**, zero-install:
+
+```bash
+cd ~/public_html
+bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/ratsweepr.sh) scan
+```
+
+> Pin a tag or commit SHA in these URLs for anything unattended
+> (`.../ratsweepr/v3.0.0/ratsweepr.sh`) — never let cron run whatever
+> `main` happens to be. Use `bash <(curl ...)`, not `curl | bash`:
+> the pipe form breaks the interactive confirmation gates.
+
+## Design principles
+
+1. **Report first.** `scan` is strictly read-only and writes a tab-separated
+   `ratsweepr-<timestamp>.report` (`SEVERITY  CATEGORY  ITEM  DETAIL`).
+2. **Quarantine, never delete.** Cleanup MOVES files to
+   `~/.ratsweepr/quarantine/<batch>/` with a SHA256 manifest. Any batch can be
+   restored with one command. `rm` appears nowhere in the cleanup path.
+3. **Integrity beats signatures.** Verification against wordpress.org
+   checksums is the primary detector — it catches malware nobody has seen yet.
+4. **Backup gates.** Destructive actions require typing `I HAVE A BACKUP`
+   plus an action phrase (`QUARANTINE` / `REPLACE` / `ROTATE` / `RESTORE`).
+   RatSweepr does not make backups for you; it makes sure you made one.
+5. **No root.** Refuses to run as root (`RS_ALLOW_ROOT=1` to override, don't).
+
+## Detection layers (all free)
+
+1. **Core integrity** — api.wordpress.org checksums: modified, missing, and
+   *unknown* files in core areas (the classic dropped-shell case).
+2. **Plugin integrity** — downloads.wordpress.org plugin-checksums per
+   installed version: modified and unknown files inside each plugin.
+3. **Known malware** — rfxn/maldet MD5 database (~10k signatures, updated
+   ~daily upstream), fetched by `update-sigs`, matched locally.
+4. **Heuristics** — grep patterns from `ratsweepr-sigs.conf`: webshell
+   constructs, eval/base64 chains, GIF-header PHP files, suspicious filenames.
+   MED severity by design — review before acting.
+5. **Nulled-plugin indicators** — piracy-domain references, version-9999
+   update blockers, `pre_http_request` license interception,
+   `sslverify => false`, leftover fake license options.
+6. **PHP in uploads** and suspicious **.htaccess** directives.
+7. **Database** — script/iframe injection in posts, widget/option injection,
+   oversized autoloads, siteurl/home hijack, admin-account audit, suspicious
+   cron blobs, `--since DATE` forensic window.
+8. **Premium baselines** — snapshot MD5 manifests on a clean site
+   (`baseline`), diff live files later (`verify-baseline`).
+9. **Known CVEs** (optional) — WPScan API per plugin
+   (`export WPSCAN_API_TOKEN=...`, free tier at wpscan.com).
+
+## Commands (identical in both versions)
+
+```
+ratsweepr                     interactive TUI (bash: menu)
+ratsweepr scan [--since DATE] read-only scan -> ratsweepr-<date>.report
+ratsweepr update-sigs         refresh rfxn.hdb + pattern file
+ratsweepr baseline            hash premium plugins/themes (CLEAN site!)
+ratsweepr verify-baseline     compare current files to baselines
+ratsweepr quarantine REPORT   quarantine HIGH/MED file findings from a report
+ratsweepr restore BATCH-ID    restore a quarantine batch
+ratsweepr clean-core          replace only core files failing checksums
+ratsweepr shuffle-salts       rotate wp-config.php auth salts
+```
+
+## Configuration
+
+| Env var | Purpose |
+|---|---|
+| `RS_HOME` | tool home (default `~/.ratsweepr`) |
+| `RS_PATTERN_URL` | URL of your hosted `ratsweepr-sigs.conf` (typically this repo's raw URL) |
+| `RS_RFXN_URL` | override the maldet/rfxn MD5 feed |
+| `WPSCAN_API_TOKEN` | enable known-CVE lookups |
+| `RS_ALLOW_ROOT=1` | bypass the root refusal (don't) |
+
+### Signed signature updates
+
+If `~/.ratsweepr/ratsweepr-pub.pem` exists on a server, pattern downloads
+must pass RSA-SHA256 verification or they're rejected:
+
+```bash
+# once, on your workstation (never commit priv.pem):
+openssl genrsa -out priv.pem 4096
+openssl rsa -in priv.pem -pubout -out ratsweepr-pub.pem
+
+# after every edit to ratsweepr-sigs.conf:
+make sign-sigs          # -> ratsweepr-sigs.conf.sig ; commit both
+```
+
+## Cleanup sequence after a confirmed infection
+
+1. `ratsweepr scan --since <suspected-date>`; review the report. Heuristic
+   (MED) findings can be legitimate code — check each file.
+2. **Full backup**: `tar -czf ~/site-backup.tgz .` and `wp db export ~/db.sql`.
+3. `ratsweepr quarantine ratsweepr-<date>.report`
+4. `ratsweepr clean-core`; force-reinstall repo plugins/themes
+   (`wp plugin install --force $(wp plugin list --field=name)`); premium ones
+   fresh from the vendor, then re-run `baseline`.
+5. `ratsweepr shuffle-salts`; reset all admin passwords; delete unrecognized
+   admin users and nulled-license options flagged in the report.
+6. Re-scan until clean. Check Sucuri SiteCheck / VirusTotal for blacklisting,
+   and patch the entry point (see CVE findings) or it *will* come back.
+
+## Developing
+
+```bash
+make build      # compile for this machine
+make test       # go vet + build
+make release    # dist/ratsweepr-linux-{amd64,arm64}, darwin-arm64 + checksums.txt
+```
+
+Releases are automated: push a tag and CI builds + attaches the binaries
+that `install.sh` downloads.
+
+```bash
+git tag v3.0.1 && git push origin v3.0.1
+```
+
+Repo layout:
+
+```
+ratsweepr.sh            bash version (self-contained)
+main.go                 CLI entry + headless commands
+core.go                 env detection, signatures, hashing, HTTP
+scan.go                 all scanners (filesystem, checksums, DB, CVEs)
+actions.go              quarantine, restore, clean-core, salts, baselines
+tui.go                  Bubble Tea interface
+patterns_default.conf   embedded default heuristics (go:embed)
+ratsweepr-sigs.conf     distributable copy servers pull via RS_PATTERN_URL
+install.sh              release installer (arch detect + sha256 verify)
+Makefile                build/release tooling
+.github/workflows/      tag-triggered release builds
+```
+
+Note on `go.mod`: it currently contains `replace` directives pointing
+`golang.org/x/*` at their GitHub mirrors (an artifact of the original build
+environment). On a normal machine you may delete the `replace (...)` block
+and run `make tidy`.
+
+## Limitations — read this
+
+- Heuristic patterns false-positive; that's why they're MED and why nothing
+  is ever auto-deleted.
+- Checksum APIs cover wordpress.org packages only; premium components depend
+  on your baselines.
+- Only the MD5 portion of the maldet feed is used (hex/YARA rules need engines
+  that shared hosting can't run).
+- A scanner running *on* a compromised server can be lied to. For serious
+  incidents, also scan an offline copy of the site from a trusted machine.
+- RatSweepr removes malware artifacts; it does not patch the vulnerability
+  that let them in. Update everything and rotate every credential.

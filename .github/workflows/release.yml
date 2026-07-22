@@ -1,0 +1,48 @@
+name: release
+
+# Push a tag like v3.0.1 and this builds the binaries, generates
+# checksums.txt, and attaches everything to a GitHub Release —
+# which is exactly what install.sh downloads.
+#
+#   git tag v3.0.1 && git push origin v3.0.1
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build release binaries
+        run: make release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ratsweepr-linux-amd64
+            dist/ratsweepr-linux-arm64
+            dist/ratsweepr-darwin-arm64
+            dist/checksums.txt
+          generate_release_notes: true
+
+  # Sanity: every push to main must at least vet + build
+  ci:
+    if: false  # flip to `github.ref == 'refs/heads/main'` and move under on: push branches if wanted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: make test
