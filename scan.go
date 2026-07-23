@@ -7,7 +7,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"io"
 	"os/exec"
+	"runtime"
+	"compress/gzip"
+	"bytes"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -355,52 +359,206 @@ func (s *Scanner) allowPathURL(rel string) (bool, string) {
 	return false, ""
 }
 
-func (s *Scanner) ScanYara(files []string) {
-	yaraBin, err := exec.LookPath("yara")
+func (s *Scanner) yaraEngine() string {
+	if p, err := exec.LookPath("yara"); err == nil {
+		return p
+	}
+	yr := filepath.Join(s.Env.Home, "bin", "yr")
+	if fi, err := os.Stat(yr); err == nil && fi.Mode()&0o111 != 0 {
+		return yr
+	}
+	if os.Getenv("RS_NO_ENGINE_DL") != "1" {
+		if got := s.downloadYaraX(); got != "" {
+			return got
+		}
+	}
+	return ""
+}
+
+func (s *Scanner) downloadYaraX() string {
+	var arch string
+	switch runtime.GOARCH {
+	case "amd64":
+		arch = "x86_64-unknown-linux-musl"
+	case "arm64":
+		arch = "aarch64-unknown-linux-musl"
+	default:
+		return ""
+	}
+	url := os.Getenv("RS_YARAX_URL")
+	if url == "" {
+		url = "https://github.com/VirusTotal/yara-x/releases/latest/download/yara-x-cli-" + arch + ".gz"
+	}
+	s.progress("No YARA engine found; attempting one-time static engine download")
+	data, err := fetch(url)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		s.add(SevInfo, "yara", "-", "yara binary not found; install for maintained-ruleset coverage")
+		return ""
+	}
+	defer gz.Close()
+	bin, err := io.ReadAll(gz)
+	if err != nil {
+		return ""
+	}
+	dst := filepath.Join(s.Env.Home, "bin", "yr")
+	_ = os.MkdirAll(filepath.Dir(dst), 0o700)
+	if os.WriteFile(dst, bin, 0o700) != nil {
+		return ""
+	}
+	if exec.Command(dst, "--version").Run() != nil {
+		os.Remove(dst)
+		return ""
+	}
+	return dst
+}
+
+// nativeYara: minimal string/regex/any-all matcher for hosts without an engine.
+// Rules with positional/module/complex conditions are skipped (engine-only).
+type yaraRule struct {
+	name     string
+	strings  []*regexp.Regexp
+	literals []string
+	allOf    bool
+	skip     bool
+}
+
+var condComplex = regexp.MustCompile(`\bat |\bin \(|filesize|@|# |hash\.|pe\.|math\.| and .* and | or .* and |\bnot `)
+
+func parseYaraRules(text string) []yaraRule {
+	var rules []yaraRule
+	var cur *yaraRule
+	var cond string
+	flush := func() {
+		if cur != nil && !cur.skip && (len(cur.strings)+len(cur.literals)) > 0 {
+			cur.allOf = strings.Contains(cond, "all of them")
+			if !condComplex.MatchString(cond) {
+				rules = append(rules, *cur)
+			}
+		}
+		cur, cond = nil, ""
+	}
+	strDef := regexp.MustCompile(`^\s*\$[a-zA-Z0-9_]*\s*=\s*(.*)$`)
+	inCond := false
+	for _, line := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "rule "):
+			flush()
+			name := strings.Fields(t)[1]
+			name = regexp.MustCompile(`[^a-zA-Z0-9_].*`).ReplaceAllString(name, "")
+			cur = &yaraRule{name: name}
+			inCond = false
+		case cur != nil && strDef.MatchString(line):
+			val := strDef.FindStringSubmatch(line)[1]
+			val = regexp.MustCompile(`\s+(nocase|wide|ascii|fullword).*$`).ReplaceAllString(val, "")
+			if strings.HasPrefix(val, "\"") {
+				lit := val[1:]
+				if i := strings.Index(lit, "\""); i >= 0 {
+					lit = lit[:i]
+				}
+				cur.literals = append(cur.literals, lit)
+			} else if strings.HasPrefix(val, "/") {
+				rx := val[1:]
+				if i := strings.LastIndex(rx, "/"); i >= 0 {
+					rx = rx[:i]
+				}
+				if re, err := regexp.Compile("(?s)" + rx); err == nil {
+					cur.strings = append(cur.strings, re)
+				} else {
+					cur.skip = true
+				}
+			} else {
+				cur.skip = true // hex / unknown -> engine only
+			}
+		case strings.HasPrefix(t, "condition:"):
+			inCond = true
+			cond += strings.TrimPrefix(t, "condition:")
+		case inCond:
+			cond += " " + t
+		}
+	}
+	flush()
+	return rules
+}
+
+func (s *Scanner) ScanYara(files []string) {
+	rulesText := defaultYaraRules
+	// Path B: online rule feed
+	if u := os.Getenv("RS_RULES_URL"); u != "" {
+		if b, err := fetch(u); err == nil && strings.Contains(string(b), "rule ") {
+			rulesText += "\n" + string(b)
+		}
+	}
+	engine := s.yaraEngine()
+	if engine != "" {
+		s.progress("Running YARA scan via " + filepath.Base(engine))
+		rulesPath := filepath.Join(s.Env.Cache, "ratsweepr.yar")
+		_ = os.WriteFile(rulesPath, []byte(rulesText), 0o600)
+		for _, f := range files {
+			rel := filepath.ToSlash(s.Env.rel(f))
+			if s.verified[rel] {
+				continue
+			}
+			trusted, _ := s.allowPathURL(rel)
+			out, _ := exec.Command(engine, rulesPath, f).Output()
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line == "" {
+					continue
+				}
+				s.emitYara(strings.Fields(line)[0], f, trusted)
+			}
+		}
 		return
 	}
-	// write bundled rules to a temp file
-	rulesPath := filepath.Join(s.Env.Cache, "ratsweepr.yar")
-	_ = os.WriteFile(rulesPath, []byte(defaultYaraRules), 0o600)
-	ruleFiles := []string{rulesPath}
-	if extra := os.Getenv("RS_YARA_RULES"); extra != "" {
-		_ = filepath.WalkDir(extra, func(p string, d os.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && (strings.HasSuffix(p, ".yar") || strings.HasSuffix(p, ".yara")) {
-				ruleFiles = append(ruleFiles, p)
-			}
-			return nil
-		})
-	}
-	s.progress("Running YARA scan (bundled + operator rules)")
-	n := 0
+	// native matcher
+	s.progress("Running YARA scan via native (grep) matcher")
+	rules := parseYaraRules(rulesText)
 	for _, f := range files {
 		rel := filepath.ToSlash(s.Env.rel(f))
 		if s.verified[rel] {
 			continue
 		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		content := string(b)
 		trusted, _ := s.allowPathURL(rel)
-		for _, rf := range ruleFiles {
-			out, _ := exec.Command(yaraBin, rf, f).Output()
-			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if line == "" {
-					continue
+		for _, r := range rules {
+			matched := 0
+			total := len(r.strings) + len(r.literals)
+			for _, re := range r.strings {
+				if re.MatchString(content) {
+					matched++
 				}
-				rule := strings.Fields(line)[0]
-				sev := SevHigh
-				if strings.Contains(strings.ToLower(rule), "uploader") {
-					sev = SevMed
+			}
+			for _, lit := range r.literals {
+				if strings.Contains(content, lit) {
+					matched++
 				}
-				if trusted {
-					sev = SevInfo
-				}
-				s.add(sev, "yara:"+rule, s.Env.rel(f), "matched YARA rule "+rule)
-				n++
+			}
+			if (r.allOf && matched == total) || (!r.allOf && matched > 0) {
+				s.emitYara(r.name, f, trusted)
 			}
 		}
 	}
 }
+
+func (s *Scanner) emitYara(rule string, f string, trusted bool) {
+	sev := SevHigh
+	lr := strings.ToLower(rule)
+	if strings.Contains(lr, "uploader") || strings.Contains(lr, "_med") {
+		sev = SevMed
+	}
+	if trusted {
+		sev = SevInfo
+	}
+	s.add(sev, "yara:"+rule, s.Env.rel(f), "matched YARA rule "+rule)
+}
+
 
 func (s *Scanner) ScanHeuristics(files []string) {
 	s.progress(fmt.Sprintf("Heuristic pattern scan (%d patterns, %d files)", len(s.Sigs.Greps), len(files)))

@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.6.0"
+RS_VERSION="2.7.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -661,38 +661,146 @@ RSYARA
 }
 
 scan_yara() {
-    if ! have yara; then
-        info "yara not installed - skipping YARA scan (heuristics still run)."
-        report "INFO" "yara" "-" "yara binary not found; install for maintained-ruleset coverage"
-        return
-    fi
-    # Assemble rule files: bundled (cached) + operator-supplied dir.
     local rulesdir="$RS_SIG_DIR/yara"
     mkdir -p "$rulesdir"
-    # write bundled rules if missing or stale
-    local bver=""
-    [ -f "$rulesdir/ratsweepr.yar" ] && bver="$(sed -n 's/.*bundled-version: \([0-9.]*\).*/\1/p' "$rulesdir/ratsweepr.yar" | head -1)"
-    if [ "$bver" != "$RS_VERSION" ]; then write_bundled_yara "$rulesdir/ratsweepr.yar"; fi
-    # optional remote/extra rules
-    [ -n "${RS_YARA_RULES:-}" ] && [ -d "$RS_YARA_RULES" ] &&         find "$RS_YARA_RULES" -name '*.yar' -o -name '*.yara' > "$RS_CACHE/extrayar.$$" 2>/dev/null
 
-    info "Running YARA scan ($(grep -c '^rule ' "$rulesdir/ratsweepr.yar" 2>/dev/null) bundled rules$([ -s "$RS_CACHE/extrayar.$$" ] && echo ' + operator rules'))..."
-    local nmatch=0
+    # --- rules: bundled (stale-refreshed) + operator dir + online feed (Path B) ---
+    local bver=""
+    [ -f "$rulesdir/ratsweepr.yar" ] && bver="$(sed -n 's#.*bundled-version: \([0-9.]*\).*#\1#p' "$rulesdir/ratsweepr.yar" | head -1)"
+    [ "$bver" = "$RS_VERSION" ] || write_bundled_yara "$rulesdir/ratsweepr.yar"
+
+    # Path B: pull an updatable rule feed over HTTPS (no engine needed to fetch).
+    if [ -n "${RS_RULES_URL:-}" ]; then
+        local rtmp="$RS_CACHE/remote.yar.$$"
+        if fetch "$RS_RULES_URL" "$rtmp" && grep -q '^rule ' "$rtmp" 2>/dev/null; then
+            if [ -f "$PATTERN_PUBKEY" ] && [ "$HAVE_OPENSSL" = "1" ]; then
+                local rsig="$RS_CACHE/remote.yar.sig.$$"
+                if fetch "${RS_RULES_URL}.sig" "$rsig" \
+                   && openssl dgst -sha256 -verify "$PATTERN_PUBKEY" -signature "$rsig" "$rtmp" >/dev/null 2>&1; then
+                    mv "$rtmp" "$rulesdir/remote.yar"; ok "Pulled online YARA rules (signature VERIFIED)."
+                else
+                    warn "Online YARA rules failed signature check - rejected."; rm -f "$rtmp"
+                fi
+                rm -f "$rsig"
+            else
+                mv "$rtmp" "$rulesdir/remote.yar"; info "Pulled online YARA rules (UNVERIFIED - set a public key to require signing)."
+            fi
+        else
+            rm -f "$rtmp"
+        fi
+    fi
+
+    # collect all rule files
+    local rulefiles=(); rulefiles+=("$rulesdir/ratsweepr.yar")
+    [ -f "$rulesdir/remote.yar" ] && rulefiles+=("$rulesdir/remote.yar")
+    if [ -n "${RS_YARA_RULES:-}" ] && [ -d "$RS_YARA_RULES" ]; then
+        while IFS= read -r rf; do rulefiles+=("$rf"); done \
+            < <(find "$RS_YARA_RULES" \( -name '*.yar' -o -name '*.yara' \) 2>/dev/null)
+    fi
+
+    # --- engine: system yara, else Path A (auto-download static yara-x), else native ---
+    ensure_yara_engine
+    local engine_desc="native (grep) matcher"
+    [ -n "$YARA_ENGINE" ] && engine_desc="$($YARA_ENGINE --version 2>/dev/null | head -1 || echo engine)"
+
+    local total_rules=0 rf
+    for rf in "${rulefiles[@]}"; do
+        total_rules=$((total_rules + $(grep -c '^rule ' "$rf" 2>/dev/null || echo 0)))
+    done
+    info "Running YARA scan: $total_rules rules via $engine_desc ..."
+
+    local nmatch=0 rel
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
-        # run bundled rules
-        while IFS= read -r line; do
-            [ -n "$line" ] || continue
-            local rule="${line%% *}"
-            local sev="HIGH"; case "$rule" in *uploader*|*_MEDIUM*) sev="MED";; esac
-            if allowpath_check "$rel"; then sev="INFO"; fi
-            report "$sev" "yara:$rule" "$rel" "matched YARA rule $rule"
-            nmatch=$((nmatch+1))
-        done < <(yara "$rulesdir/ratsweepr.yar" "$f" 2>/dev/null)
+        for rf in "${rulefiles[@]}"; do
+            local rulehits
+            if [ -n "$YARA_ENGINE" ]; then
+                rulehits="$("$YARA_ENGINE" "$rf" "$f" 2>/dev/null | awk '{print $1}')"
+            else
+                rulehits="$(native_yara "$rf" "$f")"
+            fi
+            local rule
+            while IFS= read -r rule; do
+                [ -n "$rule" ] || continue
+                local sev="HIGH"; case "$rule" in *uploader*|*_MEDIUM*|*_MED*) sev="MED";; esac
+                allowpath_check "$rel" && sev="INFO"
+                report "$sev" "yara:$rule" "$rel" "matched YARA rule $rule"
+                nmatch=$((nmatch+1))
+            done <<< "$rulehits"
+        done
     done < "$PHPLIST"
-    rm -f "$RS_CACHE/extrayar.$$"
     ok "YARA scan done ($nmatch match(es))."
+}
+
+# ensure_yara_engine: sets YARA_ENGINE to a runnable binary, or "" for native.
+ensure_yara_engine() {
+    YARA_ENGINE=""
+    if have yara; then YARA_ENGINE="yara"; return; fi
+    if [ -x "$RS_BIN/yr" ]; then YARA_ENGINE="$RS_BIN/yr"; return; fi
+    # Path A: try downloading a static yara-x binary (opt-out with RS_NO_ENGINE_DL=1)
+    if [ "${RS_NO_ENGINE_DL:-0}" != "1" ]; then
+        local arch="" ; case "$(uname -m)" in
+            x86_64|amd64) arch="x86_64-unknown-linux-musl";;
+            aarch64|arm64) arch="aarch64-unknown-linux-musl";;
+        esac
+        if [ -n "$arch" ]; then
+            info "No YARA engine found; attempting one-time static engine download..."
+            local url="${RS_YARAX_URL:-https://github.com/VirusTotal/yara-x/releases/latest/download/yara-x-cli-${arch}.gz}"
+            local gz="$RS_CACHE/yrx.gz.$$"
+            if fetch "$url" "$gz" && [ -s "$gz" ]; then
+                if gunzip -c "$gz" > "$RS_BIN/yr" 2>/dev/null && chmod +x "$RS_BIN/yr" \
+                   && "$RS_BIN/yr" --version >/dev/null 2>&1; then
+                    YARA_ENGINE="$RS_BIN/yr"; ok "Static YARA engine installed -> $RS_BIN/yr"
+                else
+                    rm -f "$RS_BIN/yr"
+                    warn "Downloaded engine did not run (host may be noexec) - using native matcher."
+                fi
+            else
+                info "Engine download unavailable - using native matcher."
+            fi
+            rm -f "$gz"
+        fi
+    fi
+}
+
+# native_yara: minimal YARA-subset matcher (strings + regex + any/all-of-them),
+# used when no engine binary is available. Rules with positional/module/complex
+# conditions are skipped (only a real engine evaluates those faithfully).
+native_yara() {
+    local rulefile="$1" target="$2"
+    awk -v TARGET="$target" '
+    function reset(){ rule=""; nstr=0; delete strs; delete isregex; allof=0; skip=0; condtext="" }
+    function q(s){ gsub(/\x27/,"\x27\\\x27\x27",s); return "\x27" s "\x27" }
+    /^[[:space:]]*rule[[:space:]]+/ { reset(); rule=$2; sub(/[^a-zA-Z0-9_].*/,"",rule); next }
+    /^[[:space:]]*\$[a-zA-Z0-9_]*[[:space:]]*=/ {
+        line=$0; val=line
+        sub(/^[[:space:]]*\$[a-zA-Z0-9_]*[[:space:]]*=[[:space:]]*/,"",val)
+        gsub(/[[:space:]]+(nocase|wide|ascii|fullword).*$/,"",val)
+        if (val ~ /^".*"/) { s=val; sub(/^"/,"",s); sub(/".*$/,"",s); strs[nstr]=s; isregex[nstr]=0; nstr++ }
+        else if (val ~ /^\/.*\//) { s=val; sub(/^\//,"",s); sub(/\/[a-z]*[[:space:]]*$/,"",s); strs[nstr]=s; isregex[nstr]=1; nstr++ }
+        else { skip=1 }
+        next
+    }
+    /^[[:space:]]*condition[[:space:]]*:/ { incond=1; condtext=$0; sub(/.*condition[[:space:]]*:/,"",condtext); next }
+    incond && !/^[[:space:]]*\}/ { condtext=condtext " " $0 }
+    /^[[:space:]]*\}/ {
+        if (rule!="" && nstr>0 && !skip) {
+            if (condtext ~ /at |in \(|filesize|@|# |hash\.|pe\.|math\.| and .* and | or .* and |not /) {
+                # unsupported by native matcher -> skip
+            } else {
+                allof=(condtext ~ /all of them/); matched=0
+                for (i=0;i<nstr;i++) {
+                    cmd=(isregex[i]?"grep -lE -- ":"grep -lF -- ") q(strs[i]) " " q(TARGET) " 2>/dev/null"
+                    if ((cmd|getline r)>0 && r!="") matched++
+                    close(cmd)
+                }
+                if ((allof && matched==nstr) || (!allof && matched>0)) print rule
+            }
+        }
+        incond=0; reset(); next
+    }
+    ' "$rulefile"
 }
 
 scan_heuristics() {
