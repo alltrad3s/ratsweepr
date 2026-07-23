@@ -3,7 +3,7 @@
 # checksum, and drops it in the current directory. No root required.
 #
 # Usage:
-#   bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/install.sh)
+#   bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/install.sh)
 #   bash <(curl -sL .../install.sh) v3.0.0        # pin a specific release
 #
 # Repo layout expected (create with `gh release create` or the web UI):
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-REPO="YOU/ratsweepr"                    # <-- change to your GitHub user/repo
+REPO="alltrad3s/ratsweepr"                    # <-- change to your GitHub user/repo
 TAG="${1:-latest}"
 
 case "$(uname -m)" in
