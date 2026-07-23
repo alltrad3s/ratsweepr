@@ -125,6 +125,13 @@ ratsweepr shuffle-salts       rotate wp-config.php auth salts
 | `WPSCAN_API_TOKEN` | enable known-CVE lookups |
 | `RS_ALLOW_ROOT=1` | bypass the root refusal (don't) |
 
+Trusted-but-unverifiable vendor components (e.g. Kinsta's mu-plugins, which
+aren't on wordpress.org) are handled with `ALLOWPATH|prefix|reinstall-url`
+lines in the signature file: heuristic and external-request findings under
+that path are downgraded to INFO (integrity and malware-hash findings are
+**not** downgraded), and `clean-core` surfaces the reinstall URL. The bundled
+default covers `wp-content/mu-plugins/kinsta-mu-plugins`.
+
 ### Signed signature updates
 
 If `~/.ratsweepr/ratsweepr-pub.pem` exists on a server, pattern downloads

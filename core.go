@@ -22,7 +22,7 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.2.0"
+const appVersion = "3.3.0"
 
 //go:embed patterns_default.conf
 var defaultPatterns string
@@ -73,6 +73,7 @@ type Signatures struct {
 	Domains   []struct{ Name, Domain string }
 	Options    []string
 	AllowHosts []string
+	AllowPaths []struct{ Prefix, URL string }
 	CoreVulns  []CoreVuln
 	HDB       map[string]string // md5 -> signature name
 }
@@ -282,6 +283,15 @@ func (e *Env) LoadSignatures() (*Signatures, error) {
 			s.Options = append(s.Options, parts[1])
 		case "ALLOWHOST":
 			s.AllowHosts = append(s.AllowHosts, parts[1])
+		case "ALLOWPATH":
+			f := strings.Split(line, "|")
+			url := ""
+			if len(f) >= 3 {
+				url = f[2]
+			}
+			if len(f) >= 2 {
+				s.AllowPaths = append(s.AllowPaths, struct{ Prefix, URL string }{f[1], url})
+			}
 		}
 	}
 	if b, err := os.ReadFile(e.hdbPath()); err == nil {

@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.2.0"
+RS_VERSION="2.3.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -171,7 +171,9 @@ backup_gate() {
 
 write_default_patterns() {
     # Bundled fallback so the scanner works offline out of the box.
-    cat > "$RS_SIG_DIR/patterns.conf" << 'EOSIG'
+    printf '# RatSweepr bundled patterns [bundled-version: %s]\n' "$RS_VERSION" \
+        > "$RS_SIG_DIR/patterns.conf"
+    cat >> "$RS_SIG_DIR/patterns.conf" << 'EOSIG'
 # RatSweepr heuristic signature file
 # Lines:  TYPE|NAME|VALUE          (TYPE: GREP, FNAME, DOMAIN, OPTION)
 # GREP   = POSIX-extended regex applied to php/ico/suspected files (review!)
@@ -193,6 +195,8 @@ GREP|b374k_marker|b374k
 GREP|c99_marker|c99sh_|c99shell
 GREP|leaf_mailer|leafmailer|Leaf[[:space:]]PHP[[:space:]]Mailer
 GREP|move_uploaded_generic|copy[[:space:]]*\([[:space:]]*\$_FILES\[[^]]+\]\[.tmp_name.\]
+GREP|move_uploaded_file_shell|move_uploaded_file[[:space:]]*\([^)]*\$_FILES
+GREP|files_tmp_name_write|\$_FILES\[[^]]+\]\[['"'"'"]tmp_name
 GREP|gif_header_in_php_file|^GIF89a
 #
 # --- nulled-plugin behaviors (CaptainCore drift findings) ---
@@ -235,6 +239,14 @@ ALLOWHOST|automattic.com
 ALLOWHOST|akismet.com
 ALLOWHOST|wordfence.com
 ALLOWHOST|woocommerce.com
+ALLOWHOST|kinsta.com
+ALLOWHOST|kinsta.cloud
+#
+# --- trusted vendor paths (ALLOWPATH|prefix|reinstall-url-or-dash) ---
+# Heuristic & external-request findings under these prefixes are downgraded to
+# INFO (integrity/malware-hash findings are NOT downgraded). reinstall-url, if
+# present, is surfaced so you can refresh the component.
+ALLOWPATH|wp-content/mu-plugins/kinsta-mu-plugins|https://kinsta.com/kinsta-tools/kinsta-mu-plugins.zip
 EOSIG
     ok "Wrote bundled heuristic patterns -> $RS_SIG_DIR/patterns.conf"
 }
@@ -284,7 +296,16 @@ update_signatures() {
 }
 
 load_signatures() {
-    [ -f "$RS_SIG_DIR/patterns.conf" ] || write_default_patterns
+    # Refresh bundled patterns if missing or stamped with an older version, so
+    # `curl | bash` picks up new signatures on every script update. A signed
+    # remote pattern file (PATTERN_URL) is never clobbered.
+    local bundled_ver=""
+    [ -f "$RS_SIG_DIR/patterns.conf" ] && \
+        bundled_ver="$(sed -n 's/.*\[bundled-version: \([0-9.]*\)\].*/\1/p' "$RS_SIG_DIR/patterns.conf" | head -1)"
+    if [ ! -s "$RS_SIG_DIR/patterns.conf" ] || \
+       { [ -z "${PATTERN_URL:-}" ] && [ "$bundled_ver" != "$RS_VERSION" ]; }; then
+        write_default_patterns
+    fi
     PATTERNS_FILE="$RS_SIG_DIR/patterns.conf"
     HDB_FILE="$RS_SIG_DIR/rfxn.hdb"
 }
@@ -493,6 +514,18 @@ scan_hashdb() {
     ok "Hash database scan done."
 }
 
+# allowpath_check REL -> returns 0 if REL is under a trusted vendor prefix,
+# and sets ALLOWPATH_URL to its reinstall URL (or empty).
+allowpath_check() {
+    local rel="$1" pfx url
+    ALLOWPATH_URL=""
+    while IFS='|' read -r type pfx url; do
+        [ "$type" = "ALLOWPATH" ] || continue
+        case "$rel" in "$pfx"/*|"$pfx") ALLOWPATH_URL="$url"; return 0;; esac
+    done < "$PATTERNS_FILE"
+    return 1
+}
+
 scan_heuristics() {
     info "Running heuristic pattern scan (grep, from patterns.conf)..."
     local name rex n=0
@@ -501,8 +534,13 @@ scan_heuristics() {
         if [ "$type" = "GREP" ]; then
             n=$((n+1))
             while IFS= read -r -d '' f; do
-                grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
-                report "MED" "heuristic:$name" "${f#"$WPROOT"/}" "matched pattern '$name' - REVIEW, may be legitimate"
+                rel="${f#"$WPROOT"/}"
+                grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+                if allowpath_check "$rel"; then
+                    report "INFO" "heuristic:$name" "$rel" "matched '$name' in trusted vendor path (kinsta-mu et al) - expected"
+                else
+                    report "MED" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW, may be legitimate"
+                fi
             done < <(xargs -0 grep -lIE --null -e "$rex" < "$PHPLIST" 2>/dev/null || true)
         elif [ "$type" = "FNAME" ]; then
             while IFS= read -r -d '' f; do
@@ -700,6 +738,7 @@ scan_database() {
     db_query "SELECT option_name, option_value FROM ${P}options
               WHERE option_name IN ('siteurl','home');" \
     | while IFS=$'\t' read -r name val; do
+        [ -n "$name" ] || continue
         report "INFO" "db-url" "$name" "$val  <- confirm this is YOUR domain"
     done
 
@@ -731,6 +770,7 @@ scan_database() {
               FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID
               WHERE m.meta_key='${P}capabilities' AND m.meta_value LIKE '%administrator%';" \
     | while IFS=$'\t' read -r id login email reg; do
+        [ -n "$id" ] || continue
         report "INFO" "db-admin-user" "user:$id" "admin '$login' <$email> registered $reg  <- do you recognize this account?"
     done
 
@@ -941,6 +981,14 @@ clean_core() {
     say  '    wp plugin install --force $(wp plugin list --field=name)'
     say  '    wp theme  install --force $(wp theme  list --field=name)'
     info "Premium plugins: reinstall from the vendor, then re-run 'baseline'."
+    # Surface reinstall URLs for trusted vendor components (mu-plugins etc.)
+    while IFS='|' read -r type pfx url; do
+        [ "$type" = "ALLOWPATH" ] || continue
+        [ -n "$url" ] && [ "$url" != "-" ] || continue
+        [ -e "$WPROOT/$pfx" ] || continue
+        info "Refresh $pfx from vendor:"
+        say  "    curl -sL '$url' -o /tmp/vendor.zip && unzip -o /tmp/vendor.zip -d "$WPROOT/$(dirname "$pfx")""
+    done < "$PATTERNS_FILE"
 }
 
 shuffle_salts() {

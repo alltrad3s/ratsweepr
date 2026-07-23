@@ -344,6 +344,15 @@ func (s *Scanner) ScanHashDB(files []string) {
 	}
 }
 
+func (s *Scanner) allowPathURL(rel string) (bool, string) {
+	for _, ap := range s.Sigs.AllowPaths {
+		if rel == ap.Prefix || strings.HasPrefix(rel, ap.Prefix+"/") {
+			return true, ap.URL
+		}
+	}
+	return false, ""
+}
+
 func (s *Scanner) ScanHeuristics(files []string) {
 	s.progress(fmt.Sprintf("Heuristic pattern scan (%d patterns, %d files)", len(s.Sigs.Greps), len(files)))
 	for _, p := range files {
@@ -354,10 +363,17 @@ func (s *Scanner) ScanHeuristics(files []string) {
 		if err != nil || !looksText(b) {
 			continue
 		}
+		rel := s.Env.rel(p)
+		trusted, _ := s.allowPathURL(filepath.ToSlash(rel))
 		for _, g := range s.Sigs.Greps {
 			if g.Rex.Match(b) {
-				s.add(SevMed, "heuristic:"+g.Name, s.Env.rel(p),
-					"matched pattern '"+g.Name+"' — REVIEW, may be legitimate")
+				if trusted {
+					s.add(SevInfo, "heuristic:"+g.Name, rel,
+						"matched '"+g.Name+"' in trusted vendor path — expected")
+				} else {
+					s.add(SevMed, "heuristic:"+g.Name, rel,
+						"matched pattern '"+g.Name+"' — REVIEW, may be legitimate")
+				}
 			}
 		}
 	}
