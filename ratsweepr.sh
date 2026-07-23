@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.1"
+RS_VERSION="2.9.2"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -378,7 +378,7 @@ scan_core_vulns() {
     done < "$PATTERNS_FILE"
     if [ "$hit" = "0" ]; then
         ok "No known core vulnerabilities for $WPVER (core is patched)."
-        info "Post-exploitation/compromise scan not applicable - core was never in a vulnerable range."
+        info "Running post-exploitation trace sweep anyway (a patched site can still carry prior-breach traces)..."
     fi
 }
 
@@ -507,7 +507,17 @@ scan_uploads_php() {
     info "Scanning wp-content/uploads for PHP files (should contain none)..."
     [ -d "$WPROOT/wp-content/uploads" ] || return
     while IFS= read -r -d '' f; do
-        report "HIGH" "php-in-uploads" "${f#"$WPROOT"/}" "executable PHP inside uploads - almost always malicious"
+        rel="${f#"$WPROOT"/}"
+        # Many legit plugins drop an empty "Silence is golden" index.php guard.
+        # Treat a small index.php with no real code as INFO, not HIGH.
+        local base; base="$(basename "$f")"
+        local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 999)"
+        if [ "$base" = "index.php" ] && [ "$sz" -lt 200 ] \
+           && ! grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)|eval|base64|system|exec|passthru|assert|include|require|fopen|file_put|curl' "$f" 2>/dev/null; then
+            report "INFO" "php-in-uploads" "$rel" "empty index.php silence-guard (benign) - no executable code"
+        else
+            report "HIGH" "php-in-uploads" "$rel" "executable PHP inside uploads - almost always malicious"
+        fi
     done < <(find "$WPROOT/wp-content/uploads" -type f \
              \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' \) -print0)
     ok "Uploads scan done."
@@ -660,6 +670,31 @@ rule RS_large_base64_payload {
         $a = /base64_decode\s*\(\s*["'][A-Za-z0-9+\/]{200,}/ nocase
     condition:
         $a
+}
+
+rule RS_command_exec_fallback_chain {
+    meta:
+        description = "Command-exec webshell probing disable_functions with multiple exec fallbacks (wp2shell family)"
+        severity = "HIGH"
+    strings:
+        $df = "disable_functions" nocase
+        $a = /shell_exec\s*\(\s*\$/ nocase
+        $b = /\bexec\s*\(\s*\$/ nocase
+        $c = /\bsystem\s*\(\s*\$/ nocase
+        $d = /passthru\s*\(\s*\$/ nocase
+    condition:
+        $df and 2 of ($a,$b,$c,$d)
+}
+
+rule RS_hardcoded_secret_gated_exec {
+    meta:
+        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command)"
+        severity = "HIGH"
+    strings:
+        $h = /hash_equals\s*\(\s*["'][^"']{6,}["']\s*,\s*\$_(GET|POST|REQUEST|SERVER)/ nocase
+        $e = /(system|passthru|shell_exec|exec|popen|proc_open)\s*\(\s*\$_(GET|POST|REQUEST)/ nocase
+    condition:
+        $h and $e
 }
 
 RSYARA
@@ -1083,11 +1118,22 @@ scan_database() {
 }
 
 scan_compromise_indicators() {
-    # Only runs when a matched core CVE has a disclosure date (set by scan_core_vulns).
-    # Emits UNSCORED evidence (INFO) — none of these alone proves breach; the
-    # VALUE is correlation. Requires DB access (reuses scan_database's globals).
-    [ -n "$EXPLOIT_WINDOW_START" ] || return 0
-    info "Gathering post-exploitation evidence (window from $EXPLOIT_WINDOW_START)..."
+    # Post-exploitation evidence is version-INDEPENDENT: a site updated to a patched
+    # version can still carry the attacker's users/posts/backdoors from when it WAS
+    # vulnerable. So this ALWAYS runs. If a CVE matched we use its disclosure date;
+    # otherwise we fall back to the earliest known disclosure window so traces on
+    # patched-but-previously-exploited sites are still found.
+    # Emits UNSCORED evidence (INFO) — none alone proves breach; value is correlation.
+    local WIN="$EXPLOIT_WINDOW_START"
+    local LABEL="$EXPLOIT_LABEL"
+    if [ -z "$WIN" ]; then
+        # earliest disclosure date across the CORE_VULN table (default lookback)
+        WIN="$(awk -F'|' '$1=="CORE_VULN" && $7!="" {print $7}' "$PATTERNS_FILE" 2>/dev/null | sort | head -1)"
+        LABEL="post-exploitation trace sweep (core is patched now)"
+    fi
+    [ -n "$WIN" ] || WIN="2026-07-17"   # hard fallback
+    info "Gathering post-exploitation evidence (window from $WIN)..."
+    EXPLOIT_WINDOW_START="$WIN"; EXPLOIT_LABEL="$LABEL"
 
     if [ -z "$WPCLI" ] && [ "$HAVE_MYSQL" != "1" ]; then
         report "WARN" "compromise" "-" "evidence scan skipped (no wp-cli/mysql)"
@@ -1156,6 +1202,23 @@ scan_compromise_indicators() {
             "content references a known wp2shell PoC marker (github.com/khadafigans / 'proof')"
         evidence=$((evidence+1))
     done < <(db_query "SELECT ID FROM ${P}posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50;")
+
+    # 4b) ORPHANED admin usermeta: capability/user_level rows whose user no longer
+    #     exists = a created-then-deleted privileged account (deleted-account ghost).
+    while IFS=$'\t' read -r umid uid mkey; do
+        [ -n "$umid" ] || continue
+        report "INFO" "compromise:ORPHANED_USERMETA" "usermeta:$umid" \
+            "orphaned admin meta (user_id=$uid key=$mkey) - a privileged account was created then deleted"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT m.umeta_id, m.user_id, m.meta_key FROM ${P}usermeta m LEFT JOIN ${P}users u ON u.ID=m.user_id WHERE u.ID IS NULL AND (m.meta_key='${P}capabilities' OR m.meta_key='${P}user_level') AND (m.meta_value LIKE '%administrator%' OR m.meta_value='10') LIMIT 100;")
+
+    # 4c) Suspicious admin logins/emails (wpenginebot-style impersonation, bot names).
+    while IFS=$'\t' read -r id login email reg; do
+        [ -n "$id" ] || continue
+        report "INFO" "compromise:SUSPICIOUS_ADMIN" "user:$id" \
+            "login=$login email=$email registered=$reg - suspicious admin name/email pattern"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|wpengine|hacker|shell)' OR u.user_email REGEXP '(wpenginebot|hidden|[0-9a-f]{12}@)') LIMIT 50;")
 
     # 5) PHP files written to the webroot during the exploit window (dropped shells
     #    the attacker forgot to timestomp). Uses mtime, best-effort.

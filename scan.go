@@ -380,6 +380,13 @@ func (s *Scanner) ScanUploadsPHP() {
 		n := d.Name()
 		if strings.HasSuffix(n, ".php") || strings.HasSuffix(n, ".phtml") ||
 			strings.HasSuffix(n, ".php5") || strings.HasSuffix(n, ".php7") {
+			if n == "index.php" {
+				if b, e := os.ReadFile(p); e == nil && len(b) < 200 &&
+					!regexp.MustCompile(`(?i)\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)|eval|base64|system|exec|passthru|assert|include|require|fopen|file_put|curl`).Match(b) {
+					s.add(SevInfo, "php-in-uploads", s.Env.rel(p), "empty index.php silence-guard (benign) — no executable code")
+					return nil
+				}
+			}
 			s.add(SevHigh, "php-in-uploads", s.Env.rel(p), "executable PHP inside uploads — almost always malicious")
 		}
 		return nil
@@ -997,10 +1004,24 @@ func (s *Scanner) ScanDatabase() {
 // -------------------------- vulnerability lookup -------------------------------
 
 func (s *Scanner) ScanCompromiseIndicators() {
-	if s.exploitWindow == "" {
-		return
+	win := s.exploitWindow
+	label := s.exploitLabel
+	if win == "" {
+		// Post-exploitation traces are version-independent: a patched site can
+		// still carry a prior breach. Fall back to the earliest known disclosure.
+		for _, cv := range s.Sigs.CoreVulns {
+			if cv.Disclosed != "" && (win == "" || cv.Disclosed < win) {
+				win = cv.Disclosed
+			}
+		}
+		if win == "" {
+			win = "2026-07-17"
+		}
+		label = "post-exploitation trace sweep (core is patched now)"
 	}
-	s.progress("Gathering post-exploitation evidence (window from " + s.exploitWindow + ")")
+	s.exploitWindow = win
+	s.exploitLabel = label
+	s.progress("Gathering post-exploitation evidence (window from " + win + ")")
 	c, err := s.dbConfig()
 	if err != nil {
 		s.add(SevWarn, "compromise", "-", "evidence scan skipped: "+err.Error())
@@ -1085,6 +1106,14 @@ func (s *Scanner) ScanCompromiseIndicators() {
 		"SELECT ID, post_date, post_name FROM "+P+"posts WHERE post_type='oembed_cache' AND post_date >= ? LIMIT 100", s.exploitWindow+" 00:00:00")
 	evidence += q("compromise:POC_MARKER", "post:", "content references a known wp2shell PoC marker",
 		"SELECT ID FROM "+P+"posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50")
+
+	// orphaned admin usermeta = created-then-deleted privileged account
+	evidence += q("compromise:ORPHANED_USERMETA", "usermeta:", "orphaned admin meta — a privileged account was created then deleted",
+		"SELECT m.umeta_id, m.user_id, m.meta_key FROM "+P+"usermeta m LEFT JOIN "+P+"users u ON u.ID=m.user_id WHERE u.ID IS NULL AND (m.meta_key='"+P+"capabilities' OR m.meta_key='"+P+"user_level') AND (m.meta_value LIKE '%administrator%' OR m.meta_value='10') LIMIT 100")
+
+	// suspicious admin logins/emails (bot/impersonation names)
+	evidence += q("compromise:SUSPICIOUS_ADMIN", "user:", "suspicious admin name/email pattern",
+		"SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM "+P+"users u JOIN "+P+"usermeta m ON m.user_id=u.ID AND m.meta_key='"+P+"capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|wpengine|hacker|shell)' OR u.user_email REGEXP '(wpenginebot|hidden|[0-9a-f]{12}@)') LIMIT 50")
 
 	// 5) PHP files written in window (uploads/mu-plugins only)
 	if t, e := time.Parse("2006-01-02", s.exploitWindow); e == nil {

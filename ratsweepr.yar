@@ -111,3 +111,28 @@ rule RS_large_base64_payload {
     condition:
         $a
 }
+
+rule RS_command_exec_fallback_chain {
+    meta:
+        description = "Command-exec webshell probing disable_functions with multiple exec fallbacks (wp2shell family)"
+        severity = "HIGH"
+    strings:
+        $df = "disable_functions" nocase
+        $a = /shell_exec\s*\(\s*\$/ nocase
+        $b = /\bexec\s*\(\s*\$/ nocase
+        $c = /\bsystem\s*\(\s*\$/ nocase
+        $d = /passthru\s*\(\s*\$/ nocase
+    condition:
+        $df and 2 of ($a,$b,$c,$d)
+}
+
+rule RS_hardcoded_secret_gated_exec {
+    meta:
+        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command)"
+        severity = "HIGH"
+    strings:
+        $h = /hash_equals\s*\(\s*["'][^"']{6,}["']\s*,\s*\$_(GET|POST|REQUEST|SERVER)/ nocase
+        $e = /(system|passthru|shell_exec|exec|popen|proc_open)\s*\(\s*\$_(GET|POST|REQUEST)/ nocase
+    condition:
+        $h and $e
+}
