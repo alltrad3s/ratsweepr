@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -96,6 +97,7 @@ func (s *Scanner) RunAll() {
 	s.ScanPluginChecksums()
 	s.ScanUploadsPHP()
 	s.ScanHashDB(files)
+	s.ScanYara(files)
 	s.ScanHeuristics(files)
 	s.ScanNulled(files)
 	s.ScanExternalRequests(files)
@@ -351,6 +353,53 @@ func (s *Scanner) allowPathURL(rel string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+func (s *Scanner) ScanYara(files []string) {
+	yaraBin, err := exec.LookPath("yara")
+	if err != nil {
+		s.add(SevInfo, "yara", "-", "yara binary not found; install for maintained-ruleset coverage")
+		return
+	}
+	// write bundled rules to a temp file
+	rulesPath := filepath.Join(s.Env.Cache, "ratsweepr.yar")
+	_ = os.WriteFile(rulesPath, []byte(defaultYaraRules), 0o600)
+	ruleFiles := []string{rulesPath}
+	if extra := os.Getenv("RS_YARA_RULES"); extra != "" {
+		_ = filepath.WalkDir(extra, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && (strings.HasSuffix(p, ".yar") || strings.HasSuffix(p, ".yara")) {
+				ruleFiles = append(ruleFiles, p)
+			}
+			return nil
+		})
+	}
+	s.progress("Running YARA scan (bundled + operator rules)")
+	n := 0
+	for _, f := range files {
+		rel := filepath.ToSlash(s.Env.rel(f))
+		if s.verified[rel] {
+			continue
+		}
+		trusted, _ := s.allowPathURL(rel)
+		for _, rf := range ruleFiles {
+			out, _ := exec.Command(yaraBin, rf, f).Output()
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line == "" {
+					continue
+				}
+				rule := strings.Fields(line)[0]
+				sev := SevHigh
+				if strings.Contains(strings.ToLower(rule), "uploader") {
+					sev = SevMed
+				}
+				if trusted {
+					sev = SevInfo
+				}
+				s.add(sev, "yara:"+rule, s.Env.rel(f), "matched YARA rule "+rule)
+				n++
+			}
+		}
+	}
 }
 
 func (s *Scanner) ScanHeuristics(files []string) {

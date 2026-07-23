@@ -22,10 +22,13 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.5.0"
+const appVersion = "3.6.0"
 
 //go:embed patterns_default.conf
 var defaultPatterns string
+
+//go:embed ratsweepr.yar
+var defaultYaraRules string
 
 // Finding severities.
 const (
