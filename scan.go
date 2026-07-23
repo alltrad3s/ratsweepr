@@ -98,6 +98,7 @@ func (s *Scanner) RunAll() {
 	s.ScanHashDB(files)
 	s.ScanHeuristics(files)
 	s.ScanNulled(files)
+	s.ScanExternalRequests(files)
 	s.ScanHtaccess()
 	s.ScanDatabase()
 	s.ScanVulnerabilities()
@@ -420,6 +421,118 @@ func (s *Scanner) ScanNulled(files []string) {
 
 var htSuspRe = regexp.MustCompile(`base64|AddHandler|AddType\s+application/x-httpd-php|auto_(ap|pre)pend_file`)
 var htProtectRe = regexp.MustCompile(`php_flag\s+engine\s+off|Deny from all|Require all denied`)
+
+
+var reqCallRe = regexp.MustCompile(`(?i)(wp_remote_(get|post|request|head)|wp_safe_remote|file_get_contents|curl_setopt|curl_init|fopen|fsockopen|readfile|copy)\s*\(`)
+var urlRe = regexp.MustCompile(`https?://[^"'` + "`" + ` )]+`)
+var sslOffRe = regexp.MustCompile(`(?i)sslverify[^,]*(=>|:)\s*(false|0)`)
+var varHostRe = regexp.MustCompile(`^\$\{?[a-zA-Z_]`)
+
+var defaultAllowHosts = []string{
+	"wordpress.org", "api.wordpress.org", "downloads.wordpress.org", "s.w.org",
+	"gravatar.com", "secure.gravatar.com", "google.com", "googleapis.com",
+	"gstatic.com", "youtube.com", "youtu.be", "vimeo.com", "fonts.googleapis.com",
+	"fonts.gstatic.com", "facebook.com", "graph.facebook.com", "twitter.com",
+	"x.com", "github.com", "githubusercontent.com", "w3.org", "schema.org",
+	"gmpg.org", "paypal.com", "stripe.com", "cloudflare.com", "jsdelivr.net", "unpkg.com",
+}
+
+func hostFromURL(u string) string {
+	h := u
+	h = strings.TrimPrefix(strings.TrimPrefix(h, "https://"), "http://")
+	if i := strings.IndexAny(h, "/:?"); i >= 0 {
+		h = h[:i]
+	}
+	return h
+}
+
+func (s *Scanner) ScanExternalRequests(files []string) {
+	s.progress("Discovering external request destinations (runtime HTTP calls)")
+	allow := map[string]bool{}
+	for _, h := range defaultAllowHosts {
+		allow[h] = true
+	}
+	for _, h := range s.Sigs.AllowHosts {
+		allow[h] = true
+	}
+	allowed := func(host string) bool {
+		for a := range allow {
+			if host == a || strings.HasSuffix(host, "."+a) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// files that hook pre_http_request (license/update interception context)
+	hookFile := map[string]bool{}
+	for _, p := range files {
+		b, err := os.ReadFile(p)
+		if err == nil && regexp.MustCompile(`add_filter\s*\(\s*['` + "`" + `"]pre_http_request`).Match(b) {
+			hookFile[s.Env.rel(p)] = true
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, p := range files {
+		if s.verified[filepath.ToSlash(s.Env.rel(p))] {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || !looksText(b) {
+			continue
+		}
+		rel := s.Env.rel(p)
+		for i, line := range strings.Split(string(b), "\n") {
+			if !reqCallRe.MatchString(line) {
+				continue
+			}
+			u := urlRe.FindString(line)
+			if u == "" {
+				continue
+			}
+			host := hostFromURL(u)
+			if host == "" || varHostRe.MatchString(host) {
+				continue
+			}
+			key := host + "\x00" + rel
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			var flags []string
+			known := allowed(host)
+			if !known {
+				flags = append(flags, "unknown-host")
+			}
+			http := strings.HasPrefix(u, "http://")
+			if http {
+				flags = append(flags, "http")
+			}
+			noverify := sslOffRe.MatchString(line)
+			if noverify {
+				flags = append(flags, "sslverify-off")
+			}
+			hook := hookFile[rel]
+			if hook {
+				flags = append(flags, "near-license-hook")
+			}
+
+			sev := SevInfo
+			switch {
+			case !known && (http || noverify || hook):
+				sev = SevHigh
+			case !known:
+				sev = SevMed
+			case hook:
+				sev = SevMed
+			}
+			s.add(sev, "external-request", fmt.Sprintf("%s:%d", rel, i+1),
+				"external request to "+host+" ["+strings.Join(flags, ",")+"]")
+		}
+	}
+}
 
 func (s *Scanner) ScanHtaccess() {
 	s.progress("Auditing .htaccess files")

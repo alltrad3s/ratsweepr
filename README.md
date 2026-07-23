@@ -82,13 +82,23 @@ bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/ratsweepr.s
    `/wp-json/batch/v1` endpoint (both permalink and `?rest_route=` forms). The
    table lives in the signature file, so new core CVEs ship via `update-sigs`
    without a code change.
-7. **PHP in uploads** and suspicious **.htaccess** directives.
-8. **Database** — script/iframe injection in posts, widget/option injection,
+7. **External request discovery** — extracts every host the code contacts via
+   a real HTTP call (`wp_remote_*`, `file_get_contents`, cURL, etc.), ignoring
+   URLs that only appear in comments or docs. Each destination is ranked by
+   context: an *unknown* host reached over plaintext HTTP, with
+   `sslverify => false`, or inside a file that hooks `pre_http_request`
+   escalates to HIGH; known/allowlisted vendors stay silent. This is
+   **discovery, not denylist** — it surfaces the malicious callback (e.g. a
+   nulled plugin phoning a piracy server) even when that domain has never been
+   blacklisted. Tune with `ALLOWHOST|host` lines in the signature file. The
+   report ends with an "External contact points" digest, worst-severity-first.
+8. **PHP in uploads** and suspicious **.htaccess** directives.
+9. **Database** — script/iframe injection in posts, widget/option injection,
    oversized autoloads, siteurl/home hijack, admin-account audit, suspicious
    cron blobs, `--since DATE` forensic window.
-9. **Premium baselines** — snapshot MD5 manifests on a clean site
+10. **Premium baselines** — snapshot MD5 manifests on a clean site
    (`baseline`), diff live files later (`verify-baseline`).
-10. **Known CVEs** (optional) — WPScan API per plugin
+11. **Known CVEs** (optional) — WPScan API per plugin
    (`export WPSCAN_API_TOKEN=...`, free tier at wpscan.com).
 
 ## Commands (identical in both versions)

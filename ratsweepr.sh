@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.1.0"
+RS_VERSION="2.2.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -228,6 +228,13 @@ OPTION|monsterinsights_license
 CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|6.9.0|6.9.4|6.9.5|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
 CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|7.0.0|7.0.1|7.0.2|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
 CORE_VULN|CVE-2026-60137 (SQLi, author__not_in)|6.8.0|6.8.5|6.8.6|WP_Query SQL injection; upgrade to 6.8.6+
+#
+# --- external-request allowlist (ALLOWHOST|host, suffix match) ---
+ALLOWHOST|elementor.com
+ALLOWHOST|automattic.com
+ALLOWHOST|akismet.com
+ALLOWHOST|wordfence.com
+ALLOWHOST|woocommerce.com
 EOSIG
     ok "Wrote bundled heuristic patterns -> $RS_SIG_DIR/patterns.conf"
 }
@@ -537,6 +544,87 @@ scan_nulled() {
         done
     done
     ok "Nulled-plugin check done."
+}
+
+scan_external_requests() {
+    info "Discovering external request destinations (runtime HTTP calls)..."
+    # Allowlist of hosts that are unremarkable for a WP site to contact. Extend
+    # via ALLOWHOST lines in patterns.conf. Matched as suffix (api.x.com ~ x.com).
+    local allow="$RS_CACHE/allowhosts.$$"
+    {
+        printf '%s\n' wordpress.org api.wordpress.org downloads.wordpress.org \
+            s.w.org gravatar.com secure.gravatar.com google.com googleapis.com \
+            gstatic.com youtube.com youtu.be vimeo.com fonts.googleapis.com \
+            fonts.gstatic.com facebook.com graph.facebook.com twitter.com x.com \
+            github.com githubusercontent.com w3.org schema.org gmpg.org \
+            paypal.com stripe.com cloudflare.com jsdelivr.net unpkg.com
+        awk -F'|' '$1=="ALLOWHOST"{print $2}' "$PATTERNS_FILE"
+    } | sort -u > "$allow"
+
+    # Pull lines where a URL is an argument to a real HTTP call. Emit host<TAB>file<TAB>line<TAB>flags
+    local hits="$RS_CACHE/exthits.$$"; : > "$hits"
+    while IFS= read -r -d '' f; do
+        # scan PHP-ish files only; skip integrity-verified core/plugin files
+        grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
+        awk -v REL="${f#"$WPROOT"/}" '
+            {
+                line=$0
+                # only lines that both contain a request primitive AND a url
+                if (line ~ /(wp_remote_(get|post|request|head)|wp_safe_remote|file_get_contents|curl_setopt|curl_init|fopen|fsockopen|@?file|readfile|copy)\s*\(/ \
+                    && match(line, /https?:\/\/[^"'"'"' )]+/)) {
+                    url=substr(line, RSTART, RLENGTH)
+                    host=url; sub(/^https?:\/\//,"",host); sub(/[\/:?].*/,"",host)
+                    if (host=="" || host ~ /\$\{?[a-zA-Z_]/) next   # skip variable hosts
+                    flags=""
+                    if (url ~ /^http:\/\//) flags=flags "PLAINTEXT,"
+                    if (line ~ /sslverify[^,]*(=>|:)[[:space:]]*(false|0)/) flags=flags "NOVERIFY,"
+                    if (line ~ /\$[a-zA-Z_]/) flags=flags "DYNAMIC,"
+                    printf "%s\t%s\t%d\t%s\n", host, REL, NR, flags
+                }
+            }' "$f" >> "$hits"
+    done < "$PHPLIST"
+
+    if [ ! -s "$hits" ]; then
+        ok "No external request destinations found."
+        rm -f "$allow" "$hits"; return
+    fi
+
+    # Rank: unknown host = base risk; plaintext/noverify/near-license-hook escalate.
+    # A host is "near a license/update hook" if the same file also hooks pre_http_request.
+    local hookfiles="$RS_CACHE/hookfiles.$$"
+    xargs -0 grep -lE "add_filter\s*\(\s*['\"]pre_http_request" < "$PHPLIST" 2>/dev/null \
+        | sed "s#^$WPROOT/##" | sort -u > "$hookfiles" || true
+
+    local host file ln flags known esc detail sev
+    # de-dup on host+file
+    sort -u "$hits" | while IFS=$'\t' read -r host file ln flags; do
+        # allowlisted (suffix match)?
+        known=0
+        while IFS= read -r a; do
+            case "$host" in *".$a"|"$a") known=1; break;; esac
+        done < "$allow"
+
+        esc=""
+        [ "$known" = "0" ] && esc="unknown-host,"
+        case ",$flags" in *PLAINTEXT*) esc="${esc}http,";; esac
+        case ",$flags" in *NOVERIFY*) esc="${esc}sslverify-off,";; esac
+        if grep -Fxq "$file" "$hookfiles" 2>/dev/null; then esc="${esc}near-license-hook,"; fi
+
+        detail="external request to $host [${esc%,}]"
+        # severity: unknown host + (http|noverify|hook) = HIGH; unknown alone = MED; known w/ hook = MED; else INFO
+        if [ "$known" = "0" ] && { case ",$esc" in *http,*|*sslverify-off,*|*near-license-hook,*) true;; *) false;; esac; }; then
+            sev="HIGH"
+        elif [ "$known" = "0" ]; then
+            sev="MED"
+        elif case ",$esc" in *near-license-hook,*) true;; *) false;; esac; then
+            sev="MED"
+        else
+            sev="INFO"
+        fi
+        report "$sev" "external-request" "$file:$ln" "$detail"
+    done
+    rm -f "$allow" "$hits" "$hookfiles"
+    ok "External-request discovery done."
 }
 
 scan_htaccess() {
@@ -897,6 +985,7 @@ run_scan() {
     scan_hashdb
     scan_heuristics
     scan_nulled
+    scan_external_requests
     scan_htaccess
     scan_database
     scan_vulnerabilities
@@ -920,6 +1009,22 @@ run_scan() {
     if [ "$med" -gt 0 ]; then
         say "  --- MED (first 25) ---"
         awk -F'\t' '$1=="MED"{printf "  %-22s %s\n", $2, $3}' "$REPORT" | head -25
+    fi
+    say ""
+    # Grouped external-request digest: one line per unique host, worst severity.
+    if grep -q $'\texternal-request\t' "$REPORT" 2>/dev/null; then
+        say ""
+        say "  --- External contact points (review unknowns) ---"
+        awk -F'\t' '$2=="external-request"{
+            n=split($4,a," "); h=""
+            for(i=1;i<n;i++) if(a[i]=="to"){h=a[i+1];break}
+            if(h==""){next}
+            rank["HIGH"]=3;rank["MED"]=2;rank["INFO"]=1
+            if(rank[$1]>best[h]){best[h]=rank[$1];bs[h]=$1}
+            cnt[h]++
+        } END{
+            for(h in cnt) printf "  %-5s %-40s (%d call site%s)\n", bs[h], h, cnt[h], (cnt[h]>1?"s":"")
+        }' "$REPORT" | sort
     fi
     say ""
     say "  Full report: $REPORT"
