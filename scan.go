@@ -24,13 +24,14 @@ type Scanner struct {
 	progress func(string)
 	found    func(Finding)
 	Findings []Finding
+	verified map[string]bool // files byte-identical to official releases
 }
 
 func NewScanner(e *Env, sigs *Signatures, progress func(string), found func(Finding)) *Scanner {
 	if progress == nil {
 		progress = func(string) {}
 	}
-	s := &Scanner{Env: e, Sigs: sigs, progress: progress}
+	s := &Scanner{Env: e, Sigs: sigs, progress: progress, verified: map[string]bool{}}
 	s.found = func(f Finding) {
 		s.Findings = append(s.Findings, f)
 		if found != nil {
@@ -44,8 +45,53 @@ func (s *Scanner) add(sev, cat, item, detail string) {
 	s.found(Finding{sev, cat, item, detail})
 }
 
+func verLE(a, b string) bool {
+	pa := strings.Split(a, ".")
+	pb := strings.Split(b, ".")
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y int
+		if i < len(pa) {
+			x, _ = strconv.Atoi(pa[i])
+		}
+		if i < len(pb) {
+			y, _ = strconv.Atoi(pb[i])
+		}
+		if x != y {
+			return x < y
+		}
+	}
+	return true // equal
+}
+
+var batchRe = regexp.MustCompile(`(?i)batch-route|wp2shell|63030`)
+
+func (s *Scanner) ScanCoreVulns() {
+	s.progress("Checking WordPress " + s.Env.WPVersion + " against known core vulnerabilities")
+	v := s.Env.WPVersion
+	for _, cv := range s.Sigs.CoreVulns {
+		if verLE(cv.Min, v) && verLE(v, cv.Max) {
+			detail := cv.Label + " — fixed in " + cv.Fixed + ". " + cv.Note
+			if batchRe.MatchString(cv.Label) {
+				detail += "\n  UPGRADE: wp core update  (real fix)\n" +
+					"  STOPGAP if you cannot upgrade — block BOTH endpoint forms at the server/WAF:\n" +
+					"    Apache (.htaccess, before WP rules):\n" +
+					"      RewriteRule ^wp-json/batch/v1 - [F,L]\n" +
+					"      RewriteCond %{QUERY_STRING} (^|&)rest_route=/?batch/v1 [NC]\n" +
+					"      RewriteRule .* - [F,L]\n" +
+					"    Nginx:\n" +
+					"      location ~* ^/wp-json/batch/v1 { return 403; }\n" +
+					"      if ($args ~* \"(^|&)rest_route=/?batch/v1\") { return 403; }"
+			} else {
+				detail += "\n  UPGRADE: wp core update"
+			}
+			s.add(SevHigh, "core-vulnerable", "WordPress "+v, detail)
+		}
+	}
+}
+
 func (s *Scanner) RunAll() {
 	files := s.Env.phpishFiles()
+	s.ScanCoreVulns()
 	s.ScanCoreChecksums()
 	s.ScanPluginChecksums()
 	s.ScanUploadsPHP()
@@ -101,15 +147,21 @@ func (s *Scanner) ScanCoreChecksums() {
 		p := filepath.Join(s.Env.WPRoot, rel)
 		got, err := md5File(p)
 		if err != nil {
-			if strings.HasPrefix(rel, "wp-content/") {
+			switch {
+			case rel == "wp-config-sample.php":
+				s.add(SevInfo, "core-sample-missing", rel,
+					"wp-config-sample.php absent — commonly removed as hardening, not an infection sign")
+			case strings.HasPrefix(rel, "wp-content/"):
 				s.add(SevInfo, "core-bundled-missing", rel, "bundled default theme/plugin file absent (often intentional)")
-			} else {
+			default:
 				s.add(SevHigh, "core-missing", rel, "core file missing or unreadable")
 			}
 			continue
 		}
 		if got != want {
 			s.add(SevHigh, "core-modified", rel, "does not match official "+s.Env.WPVersion+" checksum")
+		} else {
+			s.verified[rel] = true
 		}
 	}
 	// files present in core areas but not in the manifest = dropped files
@@ -238,6 +290,8 @@ func (s *Scanner) ScanPluginChecksums() {
 			if !md5Set(info.MD5)[got] {
 				s.add(SevHigh, "plugin-modified", "wp-content/plugins/"+slug+"/"+rel,
 					"does not match official "+slug+" "+ver+" checksums")
+			} else {
+				s.verified["wp-content/plugins/"+slug+"/"+rel] = true
 			}
 		}
 		_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
@@ -292,6 +346,9 @@ func (s *Scanner) ScanHashDB(files []string) {
 func (s *Scanner) ScanHeuristics(files []string) {
 	s.progress(fmt.Sprintf("Heuristic pattern scan (%d patterns, %d files)", len(s.Sigs.Greps), len(files)))
 	for _, p := range files {
+		if s.verified[filepath.ToSlash(s.Env.rel(p))] {
+			continue // byte-identical to the official release; cannot be injected
+		}
 		b, err := os.ReadFile(p)
 		if err != nil || !looksText(b) {
 			continue
@@ -332,6 +389,9 @@ func looksText(b []byte) bool {
 func (s *Scanner) ScanNulled(files []string) {
 	s.progress("Checking for nulled-plugin indicators")
 	for _, p := range files {
+		if s.verified[filepath.ToSlash(s.Env.rel(p))] {
+			continue
+		}
 		b, err := os.ReadFile(p)
 		if err != nil || !looksText(b) {
 			continue

@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.0.0"
+RS_VERSION="2.1.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -222,6 +222,12 @@ OPTION|gpltokenid
 OPTION|rg_gforms_key
 OPTION|fusion_registration_data
 OPTION|monsterinsights_license
+#
+# --- known-vulnerable WordPress core versions (CORE_VULN|label|min|max|fixed|note) ---
+# max is INCLUSIVE. Version compare is dotted-numeric. Update via signed feed.
+CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|6.9.0|6.9.4|6.9.5|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
+CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|7.0.0|7.0.1|7.0.2|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
+CORE_VULN|CVE-2026-60137 (SQLi, author__not_in)|6.8.0|6.8.5|6.8.6|WP_Query SQL injection; upgrade to 6.8.6+
 EOSIG
     ok "Wrote bundled heuristic patterns -> $RS_SIG_DIR/patterns.conf"
 }
@@ -289,6 +295,46 @@ build_php_filelist() {
          > "$PHPLIST" 2>/dev/null
 }
 
+# ver_le A B  -> returns 0 (true) if dotted-numeric A <= B
+ver_le() {
+    [ "$1" = "$2" ] && return 0
+    local lo
+    lo="$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | head -1)"
+    [ "$lo" = "$1" ]
+}
+
+scan_core_vulns() {
+    info "Checking WordPress $WPVER against known core vulnerabilities..."
+    local label lo hi fixed note hit=0
+    while IFS='|' read -r type label lo hi fixed note; do
+        [ "$type" = "CORE_VULN" ] || continue
+        if ver_le "$lo" "$WPVER" && ver_le "$WPVER" "$hi"; then
+            hit=1
+            report "HIGH" "core-vulnerable" "WordPress $WPVER" \
+                "$label — fixed in $fixed. $note"
+            warn "VULNERABLE CORE: $label"
+            warn "  Your version : $WPVER"
+            warn "  Fixed in     : $fixed"
+            warn "  ACTION: upgrade now ->  wp core update"
+            case "$label" in
+              *batch-route*|*wp2shell*|*63030*)
+                warn "  If you cannot upgrade immediately, block the batch endpoint at the"
+                warn "  server/WAF layer. BOTH forms must be blocked (permalink AND query):"
+                warn "    Apache (.htaccess, before WP rules):"
+                warn "      RewriteEngine On"
+                warn "      RewriteRule ^wp-json/batch/v1 - [F,L]"
+                warn "      RewriteCond %{QUERY_STRING} (^|&)rest_route=/?batch/v1 [NC]"
+                warn "      RewriteRule .* - [F,L]"
+                warn "    Nginx (server block):"
+                warn "      location ~* ^/wp-json/batch/v1 { return 403; }"
+                warn "      if (\$args ~* \"(^|&)rest_route=/?batch/v1\") { return 403; }"
+                warn "  NOTE: this is a stopgap; some plugins use the batch API. Upgrading is the real fix.";;
+            esac
+        fi
+    done < "$PATTERNS_FILE"
+    [ "$hit" = "0" ] && ok "No known core vulnerabilities for $WPVER."
+}
+
 scan_core_checksums() {
     info "Verifying WordPress $WPVER core files against api.wordpress.org checksums..."
     if [ "$HAVE_PHP" != "1" ]; then
@@ -308,13 +354,17 @@ scan_core_checksums() {
         warn "Checksum API returned no data for $WPVER."; return
     fi
 
-    local fails=0
+    local fails=0 faillist="$RS_CACHE/core-fails.$$"
+    : > "$faillist"
     # md5sum -c reports FAILED / missing files; --quiet hides the OKs.
     while IFS= read -r line; do
         local f="${line%%:*}"
+        printf '%s\n' "$f" >> "$faillist"
         case "$line" in
             *": FAILED open or read")
                 case "$f" in
+                    wp-config-sample.php) report "INFO" "core-sample-missing" "$f" \
+                        "wp-config-sample.php absent - commonly removed as hardening, not an infection sign";;
                     wp-content/*) report "INFO" "core-bundled-missing" "$f" \
                         "bundled default theme/plugin file absent (often intentional)";;
                     *) report "HIGH" "core-missing" "$f" "core file missing or unreadable";;
@@ -324,6 +374,9 @@ scan_core_checksums() {
         esac
         fails=$((fails+1))
     done < <(cd "$WPROOT" && md5sum -c --quiet "$manifest" 2>/dev/null)
+    # Every manifest file that did NOT fail is integrity-verified: heuristics
+    # must never flag a file that is byte-identical to the official release.
+    comm -23 <(awk '{print $2}' "$manifest" | sort) <(sort -u "$faillist") >> "$VERIFIED"
 
     # Files present on disk in core dirs but NOT in the manifest = dropped files.
     local expected="$RS_CACHE/core-expected.$$" actual="$RS_CACHE/core-actual.$$"
@@ -383,7 +436,7 @@ scan_plugin_checksums() {
             if [ ! -f "$plugdir$rel" ]; then missing=$((missing+1)); continue; fi
             cur="$(md5sum "$plugdir$rel" | awk '{print $1}')"
             case ",$md5s," in
-                *",$cur,"*) : ;;
+                *",$cur,"*) printf '%s\n' "wp-content/plugins/$slug/$rel" >> "$VERIFIED" ;;
                 *) modified=$((modified+1))
                    report "HIGH" "plugin-modified" "wp-content/plugins/$slug/$rel" \
                           "does not match official $slug $ver checksums";;
@@ -441,6 +494,7 @@ scan_heuristics() {
         if [ "$type" = "GREP" ]; then
             n=$((n+1))
             while IFS= read -r -d '' f; do
+                grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
                 report "MED" "heuristic:$name" "${f#"$WPROOT"/}" "matched pattern '$name' - REVIEW, may be legitimate"
             done < <(xargs -0 grep -lIE --null -e "$rex" < "$PHPLIST" 2>/dev/null || true)
         elif [ "$type" = "FNAME" ]; then
@@ -459,6 +513,7 @@ scan_nulled() {
     while IFS='|' read -r type name dom; do
         [ "$type" = "DOMAIN" ] || continue
         while IFS= read -r -d '' f; do
+            grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
             report "HIGH" "nulled-domain:$name" "${f#"$WPROOT"/}" "references piracy/nulled domain $dom"
         done < <(xargs -0 grep -lIF --null -e "$dom" < "$PHPLIST" 2>/dev/null || true)
     done < "$PATTERNS_FILE"
@@ -831,8 +886,11 @@ shuffle_salts() {
 run_scan() {
     banner
     : > "$REPORT"
+    VERIFIED="$RS_CACHE/verified.$RUNSTAMP"
+    : > "$VERIFIED"
     load_signatures
     build_php_filelist
+    scan_core_vulns
     scan_core_checksums
     scan_plugin_checksums
     scan_uploads_php

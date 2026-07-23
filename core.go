@@ -22,7 +22,7 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.0.0"
+const appVersion = "3.1.0"
 
 //go:embed patterns_default.conf
 var defaultPatterns string
@@ -65,12 +65,15 @@ type sigPattern struct {
 	Rex  *regexp.Regexp
 }
 
+type CoreVuln struct{ Label, Min, Max, Fixed, Note string }
+
 type Signatures struct {
-	Greps   []sigPattern
-	FNames  []struct{ Name, Glob string }
-	Domains []struct{ Name, Domain string }
-	Options []string
-	HDB     map[string]string // md5 -> signature name
+	Greps     []sigPattern
+	FNames    []struct{ Name, Glob string }
+	Domains   []struct{ Name, Domain string }
+	Options   []string
+	CoreVulns []CoreVuln
+	HDB       map[string]string // md5 -> signature name
 }
 
 var versionRe = regexp.MustCompile(`\$wp_version\s*=\s*['"]([0-9.]+)['"]`)
@@ -250,6 +253,13 @@ func (e *Env) LoadSignatures() (*Signatures, error) {
 		}
 		parts := strings.SplitN(line, "|", 3)
 		if len(parts) < 2 {
+			continue
+		}
+		if parts[0] == "CORE_VULN" {
+			f := strings.Split(line, "|")
+			if len(f) == 6 {
+				s.CoreVulns = append(s.CoreVulns, CoreVuln{f[1], f[2], f[3], f[4], f[5]})
+			}
 			continue
 		}
 		switch parts[0] {

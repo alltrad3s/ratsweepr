@@ -74,13 +74,21 @@ bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/ratsweepr.s
 5. **Nulled-plugin indicators** — piracy-domain references, version-9999
    update blockers, `pre_http_request` license interception,
    `sslverify => false`, leftover fake license options.
-6. **PHP in uploads** and suspicious **.htaccess** directives.
-7. **Database** — script/iframe injection in posts, widget/option injection,
+6. **Vulnerable core versions** — checks the detected WordPress version against
+   a known-vulnerable-core table (e.g. wp2shell / CVE-2026-63030+60137 unauth
+   RCE affecting 6.9.0–6.9.4 and 7.0.0–7.0.1). Emits a HIGH finding with the
+   CVE, the fixed version, the `wp core update` fix, and — for cases where you
+   can't upgrade immediately — ready-to-paste Apache/Nginx rules to block the
+   `/wp-json/batch/v1` endpoint (both permalink and `?rest_route=` forms). The
+   table lives in the signature file, so new core CVEs ship via `update-sigs`
+   without a code change.
+7. **PHP in uploads** and suspicious **.htaccess** directives.
+8. **Database** — script/iframe injection in posts, widget/option injection,
    oversized autoloads, siteurl/home hijack, admin-account audit, suspicious
    cron blobs, `--since DATE` forensic window.
-8. **Premium baselines** — snapshot MD5 manifests on a clean site
+9. **Premium baselines** — snapshot MD5 manifests on a clean site
    (`baseline`), diff live files later (`verify-baseline`).
-9. **Known CVEs** (optional) — WPScan API per plugin
+10. **Known CVEs** (optional) — WPScan API per plugin
    (`export WPSCAN_API_TOKEN=...`, free tier at wpscan.com).
 
 ## Commands (identical in both versions)
