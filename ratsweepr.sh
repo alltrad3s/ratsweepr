@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.8.1"
+RS_VERSION="2.9.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -136,6 +136,9 @@ preflight() {
     fi
 
     RUNSTAMP="$(date +%Y-%m-%d_%H%M%S)"
+    EXPLOIT_WINDOW_START=""
+    EXPLOIT_LABEL=""
+    DBPREFIX=""
     REPORT="$WPROOT/ratsweepr-$RUNSTAMP.report"
     LOG="$WPROOT/ratsweepr-$RUNSTAMP.log"
 }
@@ -234,9 +237,9 @@ OPTION|monsterinsights_license
 #
 # --- known-vulnerable WordPress core versions (CORE_VULN|label|min|max|fixed|note) ---
 # max is INCLUSIVE. Version compare is dotted-numeric. Update via signed feed.
-CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|6.9.0|6.9.4|6.9.5|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
-CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|7.0.0|7.0.1|7.0.2|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade
-CORE_VULN|CVE-2026-60137 (SQLi, author__not_in)|6.8.0|6.8.5|6.8.6|WP_Query SQL injection; upgrade to 6.8.6+
+CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|6.9.0|6.9.4|6.9.5|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade|2026-07-17
+CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|7.0.0|7.0.1|7.0.2|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade|2026-07-17
+CORE_VULN|CVE-2026-60137 (SQLi, author__not_in)|6.8.0|6.8.5|6.8.6|WP_Query SQL injection; upgrade to 6.8.6+|2026-07-17
 #
 # --- external-request allowlist (ALLOWHOST|host, suffix match) ---
 ALLOWHOST|elementor.com
@@ -338,11 +341,19 @@ ver_le() {
 
 scan_core_vulns() {
     info "Checking WordPress $WPVER against known core vulnerabilities..."
-    local label lo hi fixed note hit=0
-    while IFS='|' read -r type label lo hi fixed note; do
+    local label lo hi fixed note disclosed hit=0
+    while IFS='|' read -r type label lo hi fixed note disclosed; do
         [ "$type" = "CORE_VULN" ] || continue
         if ver_le "$lo" "$WPVER" && ver_le "$WPVER" "$hi"; then
             hit=1
+            # Record the earliest disclosure date among matched CVEs so the
+            # compromise-indicator scan knows to run and from when.
+            if [ -n "$disclosed" ]; then
+                if [ -z "$EXPLOIT_WINDOW_START" ] || [[ "$disclosed" < "$EXPLOIT_WINDOW_START" ]]; then
+                    EXPLOIT_WINDOW_START="$disclosed"
+                fi
+                EXPLOIT_LABEL="$label"
+            fi
             report "HIGH" "core-vulnerable" "WordPress $WPVER" \
                 "$label — fixed in $fixed. $note"
             warn "VULNERABLE CORE: $label"
@@ -974,6 +985,7 @@ scan_database() {
     P="$(grep -E '^\s*\$table_prefix' "$WPROOT/wp-config.php" \
          | sed -E "s/.*=\s*['\"]([^'\"]+)['\"].*/\1/" | head -1)"
     P="${P:-wp_}"
+    DBPREFIX="$P"
     if [ -z "$WPCLI" ] && [ "$HAVE_MYSQL" != "1" ]; then
         warn "Neither WP-CLI nor mysql client found: skipping database scan."
         report "WARN" "db" "-" "database scan skipped (no wp-cli/mysql)"
@@ -1049,6 +1061,106 @@ scan_database() {
         report "MED" "db-cron" "option:cron" "cron option contains eval/base64/odd URLs - inspect with: wp cron event list"
     fi
     ok "Database scan done."
+}
+
+scan_compromise_indicators() {
+    # Only runs when a matched core CVE has a disclosure date (set by scan_core_vulns).
+    # Emits UNSCORED evidence (INFO) — none of these alone proves breach; the
+    # VALUE is correlation. Requires DB access (reuses scan_database's globals).
+    [ -n "$EXPLOIT_WINDOW_START" ] || return 0
+    info "Gathering post-exploitation evidence (window from $EXPLOIT_WINDOW_START)..."
+
+    if [ -z "$WPCLI" ] && [ "$HAVE_MYSQL" != "1" ]; then
+        report "WARN" "compromise" "-" "evidence scan skipped (no wp-cli/mysql)"
+        return
+    fi
+    local P="${DBPREFIX:-wp_}"
+    if ! db_query "SELECT 1" | grep -q 1; then
+        report "WARN" "compromise" "-" "evidence scan skipped (cannot connect to DB)"
+        return
+    fi
+
+    local evidence=0
+
+    # If a user-hiding plugin is present, the user table may be lying to us.
+    local userhider=""
+    if grep -q $'\theuristic:hides_admin_users' "$REPORT" 2>/dev/null \
+       || grep -q 'yara:RS_.*hid' "$REPORT" 2>/dev/null \
+       || grep -q 'wp-security-helper' "$REPORT" 2>/dev/null; then
+        userhider="1"
+        report "INFO" "compromise-caveat" "wp_users" \
+            "a user-hiding plugin appears active - user counts below may be manipulated; re-run after quarantining it"
+    fi
+
+    # 1) USER_ID_GAP: created-then-deleted accounts leave holes in auto_increment.
+    local maxid cnt autoinc
+    maxid="$(db_query "SELECT COALESCE(MAX(ID),0) FROM ${P}users;" | tr -d '[:space:]')"
+    cnt="$(db_query "SELECT COUNT(*) FROM ${P}users;" | tr -d '[:space:]')"
+    autoinc="$(db_query "SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_NAME='${P}users' AND TABLE_SCHEMA=DATABASE();" | tr -d '[:space:]')"
+    if [ -n "$autoinc" ] && [ -n "$cnt" ] && [ "$autoinc" -gt 0 ] 2>/dev/null; then
+        local gap=$(( autoinc - 1 - cnt ))
+        if [ "$gap" -gt 5 ] 2>/dev/null; then
+            report "INFO" "compromise:USER_ID_GAP" "${P}users" \
+                "gap=$gap (max_id=$maxid count=$cnt auto_increment=$autoinc) - accounts created then deleted; classic mass-exploitation trace"
+            evidence=$((evidence+1))
+        fi
+    fi
+
+    # 2) Admin/any users registered on/after the disclosure date.
+    while IFS=$'\t' read -r id login email reg; do
+        [ -n "$id" ] || continue
+        report "INFO" "compromise:EVIDENCE_USER" "user:$id" \
+            "login=$login email=$email registered=$reg - account created during/after exploit disclosure"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT ID, user_login, user_email, user_registered FROM ${P}users WHERE user_registered >= '$EXPLOIT_WINDOW_START 00:00:00' ORDER BY ID DESC LIMIT 100;")
+
+    # 3) wp2shell PoC post markers: request/customize_changeset with 2020-01-01
+    #    sentinel date, and oembed_cache spam posts in the window.
+    while IFS=$'\t' read -r id ptype pdate title; do
+        [ -n "$id" ] || continue
+        report "INFO" "compromise:EVIDENCE_POST" "post:$id" \
+            "type=$ptype date=$pdate title=$title - wp2shell PoC post marker"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT ID, post_type, post_date, LEFT(post_title,40) FROM ${P}posts WHERE post_type IN ('request','customize_changeset') AND post_date='2020-01-01 00:00:00' LIMIT 100;")
+
+    while IFS=$'\t' read -r id pdate slug; do
+        [ -n "$id" ] || continue
+        report "INFO" "compromise:EVIDENCE_OEMBED" "post:$id" \
+            "date=$pdate slug=$slug - oembed/spam post created in exploit window"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT ID, post_date, post_name FROM ${P}posts WHERE post_type='oembed_cache' AND post_date >= '$EXPLOIT_WINDOW_START 00:00:00' LIMIT 100;")
+
+    # 4) Known PoC attacker markers in post content.
+    while IFS=$'\t' read -r id; do
+        [ -n "$id" ] || continue
+        report "INFO" "compromise:POC_MARKER" "post:$id" \
+            "content references a known wp2shell PoC marker (github.com/khadafigans / 'proof')"
+        evidence=$((evidence+1))
+    done < <(db_query "SELECT ID FROM ${P}posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50;")
+
+    # 5) PHP files written to the webroot during the exploit window (dropped shells
+    #    the attacker forgot to timestomp). Uses mtime, best-effort.
+    local since_epoch
+    since_epoch="$(date -d "$EXPLOIT_WINDOW_START" +%s 2>/dev/null || echo 0)"
+    if [ "$since_epoch" -gt 0 ]; then
+        while IFS= read -r -d '' f; do
+            report "INFO" "compromise:FILE_IN_WINDOW" "${f#"$WPROOT"/}" \
+                "PHP file modified on/after $EXPLOIT_WINDOW_START - possible dropped payload"
+            evidence=$((evidence+1))
+        done < <(find "$WPROOT/wp-content/uploads" "$WPROOT/wp-content/mu-plugins" -type f \
+                 \( -name '*.php' -o -name '*.phtml' \) -newermt "$EXPLOIT_WINDOW_START" -print0 2>/dev/null | head -c 100000)
+    fi
+
+    if [ "$evidence" -gt 0 ]; then
+        warn "COMPROMISE INDICATORS: $evidence piece(s) of post-exploitation evidence for $EXPLOIT_LABEL."
+        warn "  These are UNSCORED leads, not proof. Correlated together (unpatched core +"
+        warn "  new users + PoC markers + files in window) they strongly suggest active breach."
+        warn "  Treat as an incident: full backup, then use 'quarantine-db' to neutralize."
+        report "INFO" "compromise-summary" "-" \
+            "$evidence post-exploitation indicator(s) for $EXPLOIT_LABEL; correlate before concluding breach"
+    else
+        ok "No post-exploitation evidence found for $EXPLOIT_LABEL (site was vulnerable but no traces detected)."
+    fi
 }
 
 scan_vulnerabilities() {
@@ -1345,6 +1457,7 @@ run_scan() {
     scan_external_requests
     scan_htaccess
     scan_database
+    scan_compromise_indicators
     scan_vulnerabilities
     rm -f "$PHPLIST"
     finalize_report
@@ -1459,6 +1572,141 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# quarantine_db: reversibly neutralize compromise findings in the database.
+# DRY-RUN by default; requires --force AND backup confirmation to apply.
+# Never DELETEs: posts get a namespaced post_status; users get login/role
+# neutralized. Every change is preceded by a SQL export to a private backup dir,
+# and recorded for restore.
+quarantine_db() {
+    local force=0
+    [ "${1:-}" = "--force" ] && force=1
+    local rpt
+    rpt="$(ls -1t "$WPROOT"/ratsweepr-*.report 2>/dev/null | head -1)"
+    [ -f "$rpt" ] || die "No scan report found - run 'scan' first."
+
+    # DB creds/prefix
+    DB_NAME="$(wpconfig_val DB_NAME)"; DB_USER="$(wpconfig_val DB_USER)"
+    DB_PASSWORD="$(wpconfig_val DB_PASSWORD)"; DB_HOST="$(wpconfig_val DB_HOST)"
+    local P; P="$(grep -E '^\s*\$table_prefix' "$WPROOT/wp-config.php" | sed -E "s/.*=\s*['\"]([^'\"]+)['\"].*/\1/" | head -1)"; P="${P:-wp_}"
+    if [ -z "$WPCLI" ] && [ "$HAVE_MYSQL" != "1" ]; then die "Need WP-CLI or mysql client for DB quarantine."; fi
+    db_query "SELECT 1" | grep -q 1 || die "Cannot connect to the database."
+
+    # collect target IDs from the report's compromise evidence
+    local postids userids
+    postids="$(awk -F'\t' '$2 ~ /^compromise:(EVIDENCE_POST|EVIDENCE_OEMBED|POC_MARKER)$/ && $3 ~ /^post:/ {sub(/post:/,"",$3); print $3}' "$rpt" | sort -un)"
+    userids="$(awk -F'\t' '$2=="compromise:EVIDENCE_USER" && $3 ~ /^user:/ {sub(/user:/,"",$3); print $3}' "$rpt" | sort -un)"
+
+    if [ -z "$postids" ] && [ -z "$userids" ]; then
+        ok "No DB compromise findings to quarantine in the latest report."
+        return
+    fi
+
+    say ""
+    warn "==================== DB QUARANTINE ===================="
+    say  "Posts to neutralize (status -> ratsweepr_quarantine):"
+    for id in $postids; do say "    post ID=$id"; done
+    say  "Users to neutralize (login/role disabled, row preserved):"
+    for id in $userids; do
+        local info; info="$(db_query "SELECT user_login, user_email FROM ${P}users WHERE ID=$id;" | head -1)"
+        say "    user ID=$id  $info"
+    done
+    say "======================================================="
+
+    if [ "$force" != "1" ]; then
+        say ""
+        warn "DRY-RUN — nothing changed. Re-run with:  ratsweepr.sh quarantine-db --force"
+        return
+    fi
+
+    backup_gate
+    say ""; say "Per-item confirmation (the DB may be manipulated by a user-hider):"
+
+    # backup dir outside webroot
+    local qdir="$RS_QUARANTINE/db-$RUNSTAMP"; mkdir -p "$qdir"
+    local manifest="$qdir/MANIFEST.tsv"; printf 'kind\tid\taction\tbackup\ttimestamp\n' > "$manifest"
+
+    # dump helper
+    dump_rows() { # dump_rows TABLE WHERE OUTFILE
+        if [ -n "$WPCLI" ]; then
+            $WPCLI db query "SELECT * FROM $1 WHERE $2" --skip-column-names >/dev/null 2>&1
+            # use mysqldump-equivalent via wp db export with table + where is limited;
+            # fall back to a portable INSERT export:
+        fi
+        # portable: emit INSERTs via mysql if available, else note limitation
+        if [ "$HAVE_MYSQL" = "1" ]; then
+            local host="${DB_HOST%%:*}" port=""; case "$DB_HOST" in *:*) port="${DB_HOST##*:}";; esac
+            MYSQL_PWD="$DB_PASSWORD" mysqldump -h "$host" ${port:+-P "$port"} -u "$DB_USER" \
+                --no-create-info --skip-extended-insert --replace --where="$2" "$DB_NAME" "$1" > "$3" 2>/dev/null
+        else
+            # WP-CLI fallback: export whole table filtered is not supported; export table
+            $WPCLI db export "$3" --tables="$1" >/dev/null 2>&1
+        fi
+    }
+
+    local id ans
+    for id in $postids; do
+        printf '  Quarantine post ID=%s ? [y/N] ' "$id"; read -r ans
+        [ "$ans" = "y" ] || { say "    skipped"; continue; }
+        dump_rows "${P}posts" "ID=$id" "$qdir/post_${id}.sql"
+        if [ -s "$qdir/post_${id}.sql" ]; then
+            db_query "UPDATE ${P}posts SET post_status='ratsweepr_quarantine' WHERE ID=$id;" >/dev/null 2>&1
+            printf 'post\t%s\tstatus->ratsweepr_quarantine\t%s\t%s\n' "$id" "post_${id}.sql" "$(date -Iseconds)" >> "$manifest"
+            ok "    post $id quarantined (backup: post_${id}.sql)"
+        else
+            warn "    backup failed for post $id - NOT modified"
+        fi
+    done
+    for id in $userids; do
+        printf '  Quarantine user ID=%s ? [y/N] ' "$id"; read -r ans
+        [ "$ans" = "y" ] || { say "    skipped"; continue; }
+        dump_rows "${P}users" "ID=$id" "$qdir/user_${id}.sql"
+        dump_rows "${P}usermeta" "user_id=$id" "$qdir/usermeta_${id}.sql"
+        if [ -s "$qdir/user_${id}.sql" ]; then
+            # neutralize: scramble password hash, blank role caps, tag login. Row preserved.
+            db_query "UPDATE ${P}users SET user_pass=CONCAT('!RSQ!',user_pass), user_login=CONCAT('rsq_',user_login) WHERE ID=$id;" >/dev/null 2>&1
+            db_query "UPDATE ${P}usermeta SET meta_value='a:0:{}' WHERE user_id=$id AND meta_key='${P}capabilities';" >/dev/null 2>&1
+            printf 'user\t%s\tneutralized\t%s\t%s\n' "$id" "user_${id}.sql" "$(date -Iseconds)" >> "$manifest"
+            ok "    user $id neutralized (backup: user_${id}.sql)"
+        else
+            warn "    backup failed for user $id - NOT modified"
+        fi
+    done
+    say ""
+    ok "DB quarantine complete. Backups + manifest in: $qdir"
+    ok "Restore with:  ratsweepr.sh restore-db db-$RUNSTAMP"
+}
+
+# restore_db: re-import quarantined rows from their SQL backups.
+restore_db() {
+    local batch="$1"; local qdir="$RS_QUARANTINE/$batch"
+    [ -f "$qdir/MANIFEST.tsv" ] || die "No DB quarantine batch '$batch'."
+    DB_NAME="$(wpconfig_val DB_NAME)"; DB_USER="$(wpconfig_val DB_USER)"
+    DB_PASSWORD="$(wpconfig_val DB_PASSWORD)"; DB_HOST="$(wpconfig_val DB_HOST)"
+    [ "$HAVE_MYSQL" = "1" ] || [ -n "$WPCLI" ] || die "Need mysql/WP-CLI to restore."
+    warn "Restoring DB rows from backups in $batch (re-imports original values)."
+    printf 'Type "RESTORE-DB" to proceed: '; read -r ans; [ "$ans" = "RESTORE-DB" ] || die "Aborted."
+    local kind id action backup ts n=0
+    while IFS=$'\t' read -r kind id action backup ts; do
+        [ "$kind" = "kind" ] && continue
+        local sqlf="$qdir/$backup"
+        [ -f "$sqlf" ] || continue
+        # for users, also restore their usermeta backup if present
+        local extra=""
+        [ "$kind" = "user" ] && [ -f "$qdir/usermeta_${id}.sql" ] && extra="$qdir/usermeta_${id}.sql"
+        if [ "$HAVE_MYSQL" = "1" ]; then
+            local host="${DB_HOST%%:*}" port=""; case "$DB_HOST" in *:*) port="${DB_HOST##*:}";; esac
+            if MYSQL_PWD="$DB_PASSWORD" mysql -h "$host" ${port:+-P "$port"} -u "$DB_USER" "$DB_NAME" < "$sqlf" 2>>"$qdir/restore.err"; then
+                [ -n "$extra" ] && MYSQL_PWD="$DB_PASSWORD" mysql -h "$host" ${port:+-P "$port"} -u "$DB_USER" "$DB_NAME" < "$extra" 2>>"$qdir/restore.err"
+                n=$((n+1))
+            fi
+        else
+            $WPCLI db query "$(cat "$sqlf")" >/dev/null 2>&1 && n=$((n+1))
+            [ -n "$extra" ] && $WPCLI db query "$(cat "$extra")" >/dev/null 2>&1
+        fi
+    done < "$qdir/MANIFEST.tsv"
+    ok "Restored $n backup file(s) from $batch."
+}
+
 case "$cmd" in
     menu)            main_menu;;
     scan)            update_signatures; run_scan;;
@@ -1469,6 +1717,9 @@ case "$cmd" in
                      quarantine_from_report "$1";;
     restore)         [ $# -ge 1 ] || die "Usage: $0 restore <batch-id>"
                      quarantine_restore "$1";;
+    quarantine-db)   quarantine_db "${1:-}";;
+    restore-db)      [ $# -ge 1 ] || die "Usage: $0 restore-db <batch-id>"
+                     restore_db "$1";;
     clean-core)      clean_core;;
     shuffle-salts)   shuffle_salts;;
     help|-h|--help)  usage;;

@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -30,6 +31,8 @@ type Scanner struct {
 	found    func(Finding)
 	Findings []Finding
 	verified map[string]bool // files byte-identical to official releases
+	exploitWindow string // disclosure date of a matched CVE, if any
+	exploitLabel  string
 }
 
 func NewScanner(e *Env, sigs *Signatures, progress func(string), found func(Finding)) *Scanner {
@@ -75,6 +78,10 @@ func (s *Scanner) ScanCoreVulns() {
 	v := s.Env.WPVersion
 	for _, cv := range s.Sigs.CoreVulns {
 		if verLE(cv.Min, v) && verLE(v, cv.Max) {
+			if cv.Disclosed != "" && (s.exploitWindow == "" || cv.Disclosed < s.exploitWindow) {
+				s.exploitWindow = cv.Disclosed
+				s.exploitLabel = cv.Label
+			}
 			detail := cv.Label + " — fixed in " + cv.Fixed + ". " + cv.Note
 			if batchRe.MatchString(cv.Label) {
 				detail += "\n  UPGRADE: wp core update  (real fix)\n" +
@@ -107,6 +114,7 @@ func (s *Scanner) RunAll() {
 	s.ScanExternalRequests(files)
 	s.ScanHtaccess()
 	s.ScanDatabase()
+	s.ScanCompromiseIndicators()
 	s.ScanVulnerabilities()
 	s.finalizeReport()
 	s.WriteReport()
@@ -961,6 +969,123 @@ func (s *Scanner) ScanDatabase() {
 }
 
 // -------------------------- vulnerability lookup -------------------------------
+
+func (s *Scanner) ScanCompromiseIndicators() {
+	if s.exploitWindow == "" {
+		return
+	}
+	s.progress("Gathering post-exploitation evidence (window from " + s.exploitWindow + ")")
+	c, err := s.dbConfig()
+	if err != nil {
+		s.add(SevWarn, "compromise", "-", "evidence scan skipped: "+err.Error())
+		return
+	}
+	db, err := sql.Open("mysql", c.dsn())
+	if err == nil {
+		err = db.Ping()
+	}
+	if err != nil {
+		s.add(SevWarn, "compromise", "-", "evidence scan skipped (cannot connect)")
+		return
+	}
+	defer db.Close()
+	P := c.prefix
+	evidence := 0
+
+	// user-hider caveat
+	for _, f := range s.Findings {
+		if strings.Contains(f.Cat, "hides_admin_users") || strings.Contains(f.Item, "wp-security-helper") {
+			s.add(SevInfo, "compromise-caveat", P+"users",
+				"a user-hiding plugin appears active — user counts may be manipulated; re-run after quarantine")
+			break
+		}
+	}
+
+	// 1) USER_ID_GAP
+	var maxid, cnt, autoinc int64
+	db.QueryRow("SELECT COALESCE(MAX(ID),0), COUNT(*) FROM "+P+"users").Scan(&maxid, &cnt)
+	db.QueryRow("SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_NAME=? AND TABLE_SCHEMA=DATABASE()", P+"users").Scan(&autoinc)
+	if autoinc > 0 {
+		gap := autoinc - 1 - cnt
+		if gap > 5 {
+			s.add(SevInfo, "compromise:USER_ID_GAP", P+"users",
+				fmt.Sprintf("gap=%d (max_id=%d count=%d auto_increment=%d) — accounts created then deleted; classic mass-exploitation trace", gap, maxid, cnt, autoinc))
+			evidence++
+		}
+	}
+
+	q := func(cat, itemPre, detailFn, query string, args ...any) int {
+		rows, e := db.Query(query, args...)
+		if e != nil {
+			return 0
+		}
+		defer rows.Close()
+		n := 0
+		cols, _ := rows.Columns()
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			if rows.Scan(ptrs...) != nil {
+				continue
+			}
+			parts := make([]string, len(cols))
+			for i, v := range vals {
+				switch t := v.(type) {
+				case []byte:
+					parts[i] = string(t)
+				case nil:
+					parts[i] = ""
+				default:
+					parts[i] = fmt.Sprint(t)
+				}
+			}
+			s.add(SevInfo, cat, itemPre+parts[0], strings.Join(parts[1:], " ")+" — "+detailFn)
+			n++
+		}
+		return n
+	}
+
+	// 2) users registered in window
+	evidence += q("compromise:EVIDENCE_USER", "user:", "account created during/after exploit disclosure",
+		"SELECT ID, user_login, user_email, user_registered FROM "+P+"users WHERE user_registered >= ? ORDER BY ID DESC LIMIT 100", s.exploitWindow+" 00:00:00")
+
+	// 3) PoC post markers
+	evidence += q("compromise:EVIDENCE_POST", "post:", "wp2shell PoC post marker",
+		"SELECT ID, post_type, post_date FROM "+P+"posts WHERE post_type IN ('request','customize_changeset') AND post_date='2020-01-01 00:00:00' LIMIT 100")
+	evidence += q("compromise:EVIDENCE_OEMBED", "post:", "oembed/spam post created in exploit window",
+		"SELECT ID, post_date, post_name FROM "+P+"posts WHERE post_type='oembed_cache' AND post_date >= ? LIMIT 100", s.exploitWindow+" 00:00:00")
+	evidence += q("compromise:POC_MARKER", "post:", "content references a known wp2shell PoC marker",
+		"SELECT ID FROM "+P+"posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50")
+
+	// 5) PHP files written in window (uploads/mu-plugins only)
+	if t, e := time.Parse("2006-01-02", s.exploitWindow); e == nil {
+		for _, dir := range []string{"wp-content/uploads", "wp-content/mu-plugins"} {
+			root := filepath.Join(s.Env.WPRoot, dir)
+			_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if !strings.HasSuffix(p, ".php") && !strings.HasSuffix(p, ".phtml") {
+					return nil
+				}
+				if fi, e := d.Info(); e == nil && fi.ModTime().After(t) {
+					s.add(SevInfo, "compromise:FILE_IN_WINDOW", s.Env.rel(p),
+						"PHP file modified on/after "+s.exploitWindow+" — possible dropped payload")
+					evidence++
+				}
+				return nil
+			})
+		}
+	}
+
+	if evidence > 0 {
+		s.add(SevInfo, "compromise-summary", "-",
+			fmt.Sprintf("%d post-exploitation indicator(s) for %s; correlate before concluding breach", evidence, s.exploitLabel))
+	}
+}
 
 func (s *Scanner) ScanVulnerabilities() {
 	if s.Env.WPScanTok == "" {

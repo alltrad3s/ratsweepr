@@ -22,7 +22,7 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.8.1"
+const appVersion = "3.9.0"
 
 //go:embed patterns_default.conf
 var defaultPatterns string
@@ -68,7 +68,7 @@ type sigPattern struct {
 	Rex  *regexp.Regexp
 }
 
-type CoreVuln struct{ Label, Min, Max, Fixed, Note string }
+type CoreVuln struct{ Label, Min, Max, Fixed, Note, Disclosed string }
 
 type Signatures struct {
 	Greps     []sigPattern
@@ -263,8 +263,12 @@ func (e *Env) LoadSignatures() (*Signatures, error) {
 		}
 		if parts[0] == "CORE_VULN" {
 			f := strings.Split(line, "|")
-			if len(f) == 6 {
-				s.CoreVulns = append(s.CoreVulns, CoreVuln{f[1], f[2], f[3], f[4], f[5]})
+			if len(f) >= 6 {
+				disc := ""
+				if len(f) >= 7 {
+					disc = f[6]
+				}
+				s.CoreVulns = append(s.CoreVulns, CoreVuln{f[1], f[2], f[3], f[4], f[5], disc})
 			}
 			continue
 		}
