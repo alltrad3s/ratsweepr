@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.3.0"
+RS_VERSION="2.5.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -203,6 +203,20 @@ GREP|gif_header_in_php_file|^GIF89a
 GREP|pre_http_request_hook|add_filter[[:space:]]*\([[:space:]]*['\"]pre_http_request
 GREP|update_hook_priority_abuse|add_filter[[:space:]]*\([^,]*update_plugins[^,]*,[^,]*,[[:space:]]*9{6,}
 GREP|sslverify_disabled|['\"]sslverify['\"][[:space:]]*=>[[:space:]]*false
+#
+#
+# --- self-concealment & fake-plugin behaviors (GREPHIGH = HIGH severity) ---
+GREPHIGH|hides_self_unset_php|unset[[:space:]]*\([[:space:]]*\$[a-zA-Z_]+\[['"][^]]*/[^]]*\.php['"]
+GREPHIGH|hides_admin_users_prequery|add_(action|filter)[[:space:]]*\([[:space:]]*['"]pre_user_query['"]
+GREPHIGH|hides_admin_users_views|add_filter[[:space:]]*\([[:space:]]*['"]views_users['"]
+GREPHIGH|variable_function_eval|\$[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\([[:space:]]*gzinflate[[:space:]]*\([[:space:]]*base64_decode
+GREPHIGH|hmac_authed_backdoor|hash_hmac[[:space:]]*\([^)]*\$_(SERVER|POST|GET|REQUEST)
+GREPHIGH|fake_wordpress_author|Author URI:[[:space:]]*https?://wordpress.org/#
+GREPHIGH|fake_official_wp_plugin|Official WordPress plugin
+GREPHIGH|hides_from_list_table|unset[[:space:]]*\([^)]*wp_list_table->items
+GREPHIGH|hex_escaped_hook|add_(action|filter)[[:space:]]*\([[:space:]]*["'](\\x[0-9a-fA-F]{2}){3,}
+GREPHIGH|hex_escaped_hook_oct|add_(action|filter)[[:space:]]*\([[:space:]]*["'](\\[0-9]{2,3}){3,}
+GREPHIGH|large_base64_payload|base64_decode[[:space:]]*\([[:space:]]*["'][A-Za-z0-9+/]{200,}
 #
 # --- suspicious file names ---
 FNAME|hidden_ico|.*.ico
@@ -531,15 +545,16 @@ scan_heuristics() {
     local name rex n=0
     while IFS='|' read -r type name rex; do
         case "$type" in \#*|"") continue;; esac
-        if [ "$type" = "GREP" ]; then
+        if [ "$type" = "GREP" ] || [ "$type" = "GREPHIGH" ]; then
             n=$((n+1))
+            local basesev="MED"; [ "$type" = "GREPHIGH" ] && basesev="HIGH"
             while IFS= read -r -d '' f; do
                 rel="${f#"$WPROOT"/}"
                 grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
                 if allowpath_check "$rel"; then
                     report "INFO" "heuristic:$name" "$rel" "matched '$name' in trusted vendor path (kinsta-mu et al) - expected"
                 else
-                    report "MED" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW, may be legitimate"
+                    report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW"
                 fi
             done < <(xargs -0 grep -lIE --null -e "$rex" < "$PHPLIST" 2>/dev/null || true)
         elif [ "$type" = "FNAME" ]; then

@@ -29,7 +29,7 @@ format, signature files, and `~/.ratsweepr` home:
 
 ```bash
 cd ~/public_html    # your WordPress root — where wp-config.php lives
-bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/install.sh)
 ./ratsweepr         # TUI
 ./ratsweepr scan    # headless / cron
 ```
@@ -38,7 +38,7 @@ bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/install.sh)
 
 ```bash
 cd ~/public_html
-bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/ratsweepr.sh) scan
+bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/ratsweepr.sh) scan
 ```
 
 > Pin a tag or commit SHA in these URLs for anything unattended
@@ -73,7 +73,12 @@ bash <(curl -sL https://raw.githubusercontent.com/YOU/ratsweepr/main/ratsweepr.s
    MED severity by design — review before acting.
 5. **Nulled-plugin indicators** — piracy-domain references, version-9999
    update blockers, `pre_http_request` license interception,
-   `sslverify => false`, leftover fake license options.
+   `sslverify => false`, leftover fake license options. Also detects
+   **self-concealing fake plugins** (HIGH): components that hide themselves from
+   the plugin list (`all_plugins` filter, `unset($plugins[...])`), hide admin
+   users from queries (`pre_user_query`, `views_users` — the trick that makes a
+   compromised site show only one user), variable-function eval of
+   gzinflate/base64 payloads, and HMAC-authenticated backdoor endpoints.
 6. **Vulnerable core versions** — checks the detected WordPress version against
    a known-vulnerable-core table (e.g. wp2shell / CVE-2026-63030+60137 unauth
    RCE affecting 6.9.0–6.9.4 and 7.0.0–7.0.1). Emits a HIGH finding with the

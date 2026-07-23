@@ -22,7 +22,7 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.3.0"
+const appVersion = "3.5.0"
 
 //go:embed patterns_default.conf
 var defaultPatterns string
@@ -69,6 +69,7 @@ type CoreVuln struct{ Label, Min, Max, Fixed, Note string }
 
 type Signatures struct {
 	Greps     []sigPattern
+	GrepsHigh []sigPattern
 	FNames    []struct{ Name, Glob string }
 	Domains   []struct{ Name, Domain string }
 	Options    []string
@@ -269,6 +270,12 @@ func (e *Env) LoadSignatures() (*Signatures, error) {
 			if len(parts) == 3 {
 				if re, err := regexp.CompilePOSIX(parts[2]); err == nil {
 					s.Greps = append(s.Greps, sigPattern{parts[1], re})
+				}
+			}
+		case "GREPHIGH":
+			if len(parts) == 3 {
+				if re, err := regexp.CompilePOSIX(parts[2]); err == nil {
+					s.GrepsHigh = append(s.GrepsHigh, sigPattern{parts[1], re})
 				}
 			}
 		case "FNAME":

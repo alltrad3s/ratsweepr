@@ -365,16 +365,21 @@ func (s *Scanner) ScanHeuristics(files []string) {
 		}
 		rel := s.Env.rel(p)
 		trusted, _ := s.allowPathURL(filepath.ToSlash(rel))
-		for _, g := range s.Sigs.Greps {
-			if g.Rex.Match(b) {
-				if trusted {
-					s.add(SevInfo, "heuristic:"+g.Name, rel,
-						"matched '"+g.Name+"' in trusted vendor path — expected")
-				} else {
-					s.add(SevMed, "heuristic:"+g.Name, rel,
-						"matched pattern '"+g.Name+"' — REVIEW, may be legitimate")
-				}
+		match := func(g sigPattern, sev string) {
+			if !g.Rex.Match(b) {
+				return
 			}
+			if trusted {
+				s.add(SevInfo, "heuristic:"+g.Name, rel, "matched '"+g.Name+"' in trusted vendor path — expected")
+			} else {
+				s.add(sev, "heuristic:"+g.Name, rel, "matched pattern '"+g.Name+"' — REVIEW")
+			}
+		}
+		for _, g := range s.Sigs.Greps {
+			match(g, SevMed)
+		}
+		for _, g := range s.Sigs.GrepsHigh {
+			match(g, SevHigh)
 		}
 	}
 	for _, fn := range s.Sigs.FNames {
