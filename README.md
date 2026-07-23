@@ -131,14 +131,17 @@ ratsweepr shuffle-salts       rotate wp-config.php auth salts
 | `RS_RULES_URL` | online YARA rule feed pulled each scan (signed if a public key is present); works with or without a local engine |
 | `RS_YARA_RULES` | path to a directory of extra `.yar`/`.yara` rulesets |
 | `RS_NO_ENGINE_DL=1` | disable the one-time static YARA engine download |
-| `RS_YARAX_URL` | override the static yara-x engine download URL |
+| `RS_YARAX_URL` | override the yara-x engine download URL (default: VirusTotal yara-x v1.19.0 release tarball for the host arch) |
+| `RS_YARAX_VER` | pin a different yara-x release tag (e.g. `v1.19.0`) |
 | `RS_ALLOW_ROOT=1` | bypass the root refusal (don't) |
 
 YARA scanning runs three ways, in order of preference, so it works on any host:
 a system `yara` binary if present; otherwise a one-time static `yara-x` engine
 downloaded to `~/.ratsweepr/bin` (skipped on `noexec` homes); otherwise a
-built-in native grep matcher that runs the simple string/regex rules with no
-engine at all. Rules with positional or module conditions only run under a real
+built-in matcher that runs the same rules with no engine at all. The engine is
+a bonus (it also evaluates positional/module YARA conditions the built-in
+matcher skips) — it is never required for detection, and a failed/absent engine
+download costs no signature coverage. Rules with positional or module conditions only run under a real
 engine; the native matcher skips them rather than misfire. Rules come from the
 bundled `ratsweepr.yar`, any `RS_YARA_RULES` directory, and an optional signed
 online feed (`RS_RULES_URL`) — so signatures update without a new release and

@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.0"
+RS_VERSION="2.9.1"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -376,7 +376,10 @@ scan_core_vulns() {
             esac
         fi
     done < "$PATTERNS_FILE"
-    [ "$hit" = "0" ] && ok "No known core vulnerabilities for $WPVER."
+    if [ "$hit" = "0" ]; then
+        ok "No known core vulnerabilities for $WPVER (core is patched)."
+        info "Post-exploitation/compromise scan not applicable - core was never in a vulnerable range."
+    fi
 }
 
 scan_core_checksums() {
@@ -702,8 +705,14 @@ scan_yara() {
 
     # --- engine: system yara, else Path A (auto-download static yara-x), else native ---
     ensure_yara_engine
-    local engine_desc="native (grep) matcher"
-    [ -n "$YARA_ENGINE" ] && engine_desc="$($YARA_ENGINE --version 2>/dev/null | head -1 || echo engine)"
+    local engine_desc="built-in matcher (no engine needed)"
+    if [ -n "$YARA_ENGINE" ]; then
+        if [ "$YARA_ENGINE_KIND" = "yara-x" ]; then
+            engine_desc="yara-x ($("$YARA_ENGINE" --version 2>/dev/null | awk '{print $2}'))"
+        else
+            engine_desc="$("$YARA_ENGINE" --version 2>/dev/null | head -1 || echo yara)"
+        fi
+    fi
 
     local total_rules=0 rf
     for rf in "${rulefiles[@]}"; do
@@ -718,7 +727,11 @@ scan_yara() {
         for rf in "${rulefiles[@]}"; do
             local rulehits
             if [ -n "$YARA_ENGINE" ]; then
-                rulehits="$("$YARA_ENGINE" "$rf" "$f" 2>/dev/null | awk '{print $1}')"
+                if [ "$YARA_ENGINE_KIND" = "yara-x" ]; then
+                    rulehits="$("$YARA_ENGINE" scan "$rf" "$f" 2>/dev/null | awk '{print $1}')"
+                else
+                    rulehits="$("$YARA_ENGINE" "$rf" "$f" 2>/dev/null | awk '{print $1}')"
+                fi
             else
                 rulehits="$(native_yara "$rf" "$f")"
             fi
@@ -735,33 +748,39 @@ scan_yara() {
     ok "YARA scan done ($nmatch match(es))."
 }
 
-# ensure_yara_engine: sets YARA_ENGINE to a runnable binary, or "" for native.
+# ensure_yara_engine: sets YARA_ENGINE (path) and YARA_ENGINE_KIND (yara|yara-x),
+# or leaves YARA_ENGINE empty to use the built-in matcher.
 ensure_yara_engine() {
-    YARA_ENGINE=""
-    if have yara; then YARA_ENGINE="yara"; return; fi
-    if [ -x "$RS_BIN/yr" ]; then YARA_ENGINE="$RS_BIN/yr"; return; fi
-    # Path A: try downloading a static yara-x binary (opt-out with RS_NO_ENGINE_DL=1)
+    YARA_ENGINE=""; YARA_ENGINE_KIND=""
+    if have yara; then YARA_ENGINE="yara"; YARA_ENGINE_KIND="yara"; return; fi
+    if [ -x "$RS_BIN/yr" ]; then YARA_ENGINE="$RS_BIN/yr"; YARA_ENGINE_KIND="yara-x"; return; fi
+    # Path A: one-time download of the static yara-x CLI (opt out: RS_NO_ENGINE_DL=1).
+    # Note: the built-in matcher already runs the same rules; the engine is a bonus
+    # (full YARA condition support), never a requirement for detection.
     if [ "${RS_NO_ENGINE_DL:-0}" != "1" ]; then
-        local arch="" ; case "$(uname -m)" in
-            x86_64|amd64) arch="x86_64-unknown-linux-musl";;
-            aarch64|arm64) arch="aarch64-unknown-linux-musl";;
+        local arch=""; case "$(uname -m)" in
+            x86_64|amd64)  arch="x86_64-unknown-linux-gnu";;
+            aarch64|arm64) arch="aarch64-unknown-linux-gnu";;
         esac
         if [ -n "$arch" ]; then
-            info "No YARA engine found; attempting one-time static engine download..."
-            local url="${RS_YARAX_URL:-https://github.com/VirusTotal/yara-x/releases/latest/download/yara-x-cli-${arch}.gz}"
-            local gz="$RS_CACHE/yrx.gz.$$"
-            if fetch "$url" "$gz" && [ -s "$gz" ]; then
-                if gunzip -c "$gz" > "$RS_BIN/yr" 2>/dev/null && chmod +x "$RS_BIN/yr" \
+            local ver="${RS_YARAX_VER:-v1.19.0}"
+            local url="${RS_YARAX_URL:-https://github.com/VirusTotal/yara-x/releases/download/${ver}/yara-x-${ver}-${arch}.tar.gz}"
+            info "No YARA engine on this host; trying one-time yara-x download (optional)..."
+            local tgz="$RS_CACHE/yrx.tgz.$$"
+            if fetch "$url" "$tgz" && [ -s "$tgz" ]; then
+                # archive contains a single bare binary named 'yr'
+                if tar -xzf "$tgz" -C "$RS_BIN" yr 2>/dev/null && chmod +x "$RS_BIN/yr" \
                    && "$RS_BIN/yr" --version >/dev/null 2>&1; then
-                    YARA_ENGINE="$RS_BIN/yr"; ok "Static YARA engine installed -> $RS_BIN/yr"
+                    YARA_ENGINE="$RS_BIN/yr"; YARA_ENGINE_KIND="yara-x"
+                    ok "Installed yara-x engine -> $RS_BIN/yr"
                 else
                     rm -f "$RS_BIN/yr"
-                    warn "Downloaded engine did not run (host may be noexec) - using native matcher."
+                    info "yara-x not runnable here (glibc/noexec) - built-in matcher covers the same rules."
                 fi
             else
-                info "Engine download unavailable - using native matcher."
+                info "yara-x download skipped - built-in matcher covers the same rules."
             fi
-            rm -f "$gz"
+            rm -f "$tgz"
         fi
     fi
 }

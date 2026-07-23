@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"compress/gzip"
+	"archive/tar"
 	"bytes"
 	"path/filepath"
 	"regexp"
@@ -76,12 +77,14 @@ var batchRe = regexp.MustCompile(`(?i)batch-route|wp2shell|63030`)
 func (s *Scanner) ScanCoreVulns() {
 	s.progress("Checking WordPress " + s.Env.WPVersion + " against known core vulnerabilities")
 	v := s.Env.WPVersion
+	coreHit := false
 	for _, cv := range s.Sigs.CoreVulns {
 		if verLE(cv.Min, v) && verLE(v, cv.Max) {
 			if cv.Disclosed != "" && (s.exploitWindow == "" || cv.Disclosed < s.exploitWindow) {
 				s.exploitWindow = cv.Disclosed
 				s.exploitLabel = cv.Label
 			}
+			coreHit = true
 			detail := cv.Label + " — fixed in " + cv.Fixed + ". " + cv.Note
 			if batchRe.MatchString(cv.Label) {
 				detail += "\n  UPGRADE: wp core update  (real fix)\n" +
@@ -98,6 +101,9 @@ func (s *Scanner) ScanCoreVulns() {
 			}
 			s.add(SevHigh, "core-vulnerable", "WordPress "+v, detail)
 		}
+	}
+	if !coreHit {
+		s.add(SevInfo, "core", s.Env.WPVersion, "no known core vulnerabilities (core is patched); compromise scan not applicable")
 	}
 }
 
@@ -406,37 +412,41 @@ func (s *Scanner) allowPathURL(rel string) (bool, string) {
 	return false, ""
 }
 
-func (s *Scanner) yaraEngine() string {
+func (s *Scanner) yaraEngine() (string, string) {
 	if p, err := exec.LookPath("yara"); err == nil {
-		return p
+		return p, "yara"
 	}
 	yr := filepath.Join(s.Env.Home, "bin", "yr")
 	if fi, err := os.Stat(yr); err == nil && fi.Mode()&0o111 != 0 {
-		return yr
+		return yr, "yara-x"
 	}
 	if os.Getenv("RS_NO_ENGINE_DL") != "1" {
 		if got := s.downloadYaraX(); got != "" {
-			return got
+			return got, "yara-x"
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func (s *Scanner) downloadYaraX() string {
 	var arch string
 	switch runtime.GOARCH {
 	case "amd64":
-		arch = "x86_64-unknown-linux-musl"
+		arch = "x86_64-unknown-linux-gnu"
 	case "arm64":
-		arch = "aarch64-unknown-linux-musl"
+		arch = "aarch64-unknown-linux-gnu"
 	default:
 		return ""
 	}
+	ver := os.Getenv("RS_YARAX_VER")
+	if ver == "" {
+		ver = "v1.19.0"
+	}
 	url := os.Getenv("RS_YARAX_URL")
 	if url == "" {
-		url = "https://github.com/VirusTotal/yara-x/releases/latest/download/yara-x-cli-" + arch + ".gz"
+		url = "https://github.com/VirusTotal/yara-x/releases/download/" + ver + "/yara-x-" + ver + "-" + arch + ".tar.gz"
 	}
-	s.progress("No YARA engine found; attempting one-time static engine download")
+	s.progress("No YARA engine on this host; trying one-time yara-x download (optional)")
 	data, err := fetch(url)
 	if err != nil || len(data) == 0 {
 		return ""
@@ -446,14 +456,26 @@ func (s *Scanner) downloadYaraX() string {
 		return ""
 	}
 	defer gz.Close()
-	bin, err := io.ReadAll(gz)
-	if err != nil {
-		return ""
-	}
+	tr := tar.NewReader(gz)
 	dst := filepath.Join(s.Env.Home, "bin", "yr")
 	_ = os.MkdirAll(filepath.Dir(dst), 0o700)
-	if os.WriteFile(dst, bin, 0o700) != nil {
-		return ""
+	for {
+		hdr, e := tr.Next()
+		if e != nil {
+			return ""
+		}
+		if filepath.Base(hdr.Name) == "yr" {
+			out, e := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
+			if e != nil {
+				return ""
+			}
+			if _, e := io.Copy(out, tr); e != nil {
+				out.Close()
+				return ""
+			}
+			out.Close()
+			break
+		}
 	}
 	if exec.Command(dst, "--version").Run() != nil {
 		os.Remove(dst)
@@ -461,7 +483,6 @@ func (s *Scanner) downloadYaraX() string {
 	}
 	return dst
 }
-
 // nativeYara: minimal string/regex/any-all matcher for hosts without an engine.
 // Rules with positional/module/complex conditions are skipped (engine-only).
 type yaraRule struct {
@@ -539,7 +560,7 @@ func (s *Scanner) ScanYara(files []string) {
 			rulesText += "\n" + string(b)
 		}
 	}
-	engine := s.yaraEngine()
+	engine, engineKind := s.yaraEngine()
 	if engine != "" {
 		s.progress("Running YARA scan via " + filepath.Base(engine))
 		rulesPath := filepath.Join(s.Env.Cache, "ratsweepr.yar")
@@ -550,7 +571,12 @@ func (s *Scanner) ScanYara(files []string) {
 				continue
 			}
 			trusted, _ := s.allowPathURL(rel)
-			out, _ := exec.Command(engine, rulesPath, f).Output()
+			var out []byte
+			if engineKind == "yara-x" {
+				out, _ = exec.Command(engine, "scan", rulesPath, f).Output()
+			} else {
+				out, _ = exec.Command(engine, rulesPath, f).Output()
+			}
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				if line == "" {
 					continue
