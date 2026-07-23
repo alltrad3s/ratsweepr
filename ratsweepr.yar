@@ -136,3 +136,27 @@ rule RS_hardcoded_secret_gated_exec {
     condition:
         $h and $e
 }
+
+rule RS_globals_flood_backdoor {
+    meta:
+        description = "Backdoor obfuscated with 50+ $GLOBALS[] variable references feeding eval"
+        severity = "HIGH"
+    strings:
+        $g = /\$GLOBALS\s*\[/
+        $e = /eval\s*\(/ nocase
+    condition:
+        #g > 50 and $e
+}
+
+rule RS_remote_content_obfuscated {
+    meta:
+        description = "Obfuscated malware fetching remote content (file_get_contents/curl) and decoding/executing it"
+        severity = "HIGH"
+    strings:
+        $fetch1 = "file_get_contents" nocase
+        $fetch2 = "curl_exec" nocase
+        $dec = /(gzinflate|gzuncompress|str_rot13)\s*\(\s*base64_decode/ nocase
+        $b64url = /base64_decode\s*\(\s*["'][A-Za-z0-9+\/]{16,}["']\s*\)/ nocase
+    condition:
+        (any of ($fetch1,$fetch2)) and ($dec or $b64url)
+}

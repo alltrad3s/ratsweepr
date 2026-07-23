@@ -151,8 +151,69 @@ func headlessScan(env *Env, since string) {
 			info++
 		}
 	}
-	fmt.Printf("\nSUMMARY  HIGH:%d  MED:%d  INFO:%d\nReport: %s\n",
-		high, med, info, env.ReportPath)
+	fmt.Printf("\nSUMMARY  HIGH:%d  MED:%d  INFO:%d\n", high, med, info)
+	printClustered(sc.Findings, SevHigh)
+	printClustered(sc.Findings, SevMed)
+	fmt.Printf("Report: %s\n", env.ReportPath)
+}
+
+// printClustered groups findings by (category + file basename) so a malware
+// family sprayed across many dirs collapses to one line with a count.
+func printClustered(findings []Finding, sev string) {
+	type cl struct {
+		cat, base string
+		count     int
+		samples   []string
+	}
+	clusters := map[string]*cl{}
+	catTotals := map[string]int{}
+	var order []string
+	for _, f := range findings {
+		if f.Sev != sev {
+			continue
+		}
+		path := f.Item
+		if i := strings.Index(path, " ("); i >= 0 {
+			path = path[:i]
+		}
+		if i := strings.LastIndex(path, ":"); i >= 0 && len(path) > i+1 && path[i+1] >= '0' && path[i+1] <= '9' {
+			path = path[:i]
+		}
+		base := path
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			base = path[i+1:]
+		}
+		key := f.Cat + "\x1f" + base
+		c := clusters[key]
+		if c == nil {
+			c = &cl{cat: f.Cat, base: base}
+			clusters[key] = c
+			order = append(order, key)
+		}
+		c.count++
+		if len(c.samples) < 3 {
+			c.samples = append(c.samples, path)
+		}
+		catTotals[f.Cat]++
+	}
+	if len(order) == 0 {
+		return
+	}
+	fmt.Printf("  --- %s (clustered) ---\n", sev)
+	for _, k := range order {
+		c := clusters[k]
+		if c.count > 1 {
+			more := ""
+			if c.count > 3 {
+				more = ", ..."
+			}
+			fmt.Printf("  [%3dx] %-26s %s\n         in: %s%s\n", c.count, c.cat, c.base, strings.Join(c.samples, ", "), more)
+		}
+	}
+	fmt.Println("  -- per-category totals --")
+	for cat, n := range catTotals {
+		fmt.Printf("  %-28s %d finding(s)\n", cat, n)
+	}
 }
 
 func printProgress(p string) { fmt.Println("..", p) }

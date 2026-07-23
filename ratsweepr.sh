@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.2"
+RS_VERSION="2.9.3"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -697,6 +697,30 @@ rule RS_hardcoded_secret_gated_exec {
         $h and $e
 }
 
+rule RS_globals_flood_backdoor {
+    meta:
+        description = "Backdoor obfuscated with 50+ $GLOBALS[] variable references feeding eval"
+        severity = "HIGH"
+    strings:
+        $g = /\$GLOBALS\s*\[/
+        $e = /eval\s*\(/ nocase
+    condition:
+        #g > 50 and $e
+}
+
+rule RS_remote_content_obfuscated {
+    meta:
+        description = "Obfuscated malware fetching remote content (file_get_contents/curl) and decoding/executing it"
+        severity = "HIGH"
+    strings:
+        $fetch1 = "file_get_contents" nocase
+        $fetch2 = "curl_exec" nocase
+        $dec = /(gzinflate|gzuncompress|str_rot13)\s*\(\s*base64_decode/ nocase
+        $b64url = /base64_decode\s*\(\s*["'][A-Za-z0-9+\/]{16,}["']\s*\)/ nocase
+    condition:
+        (any of ($fetch1,$fetch2)) and ($dec or $b64url)
+}
+
 RSYARA
 }
 
@@ -842,7 +866,7 @@ native_yara() {
     incond && !/^[[:space:]]*\}/ { condtext=condtext " " $0 }
     /^[[:space:]]*\}/ {
         if (rule!="" && nstr>0 && !skip) {
-            if (condtext ~ /at |in \(|filesize|@|# |hash\.|pe\.|math\.| and .* and | or .* and |not /) {
+            if (condtext ~ /at |in \(|filesize|@|#[a-zA-Z]|# |hash\.|pe\.|math\.|[0-9]+ of | and .* and | or .* and |not /) {
                 # unsupported by native matcher -> skip
             } else {
                 allof=(condtext ~ /all of them/); matched=0
@@ -1482,6 +1506,34 @@ shuffle_salts() {
 
 # ============================ SCAN ORCHESTRATOR ===============================
 
+# summarize_clustered SEVERITY
+# Groups findings by (category + file basename) so a malware family sprayed
+# across many directories collapses to one line with a count + sample paths,
+# instead of hundreds of near-identical lines. Singletons print normally.
+summarize_clustered() {
+    local sev="$1"
+    awk -F'\t' -v SEV="$sev" '
+        $1==SEV {
+            cat=$2; item=$3
+            path=item; sub(/ \(.*/,"",path); sub(/:[0-9]+$/,"",path)
+            n=split(path,seg,"/"); base=seg[n]
+            key=cat "\x1f" base
+            cnt[key]++
+            if (cnt[key]<=3) { samp[key]=samp[key] (samp[key]==""?"":", ") path }
+            cat_of[key]=cat; base_of[key]=base
+            if (cnt[key]==1) first[key]=item
+            catcnt[cat]++
+        }
+        END {
+            for (k in cnt) if (cnt[k]>1) {
+                printf "  [%3dx] %-26s %s\n         in: %s%s\n", \
+                    cnt[k], cat_of[k], base_of[k], samp[k], (cnt[k]>3?", ...":"")
+            }
+            print "  -- per-category totals --"
+            for (c in catcnt) printf "  %-28s %d finding(s)\n", c, catcnt[c]
+        }
+    ' "$REPORT"
+}
 finalize_report() {
     # (a) Suppress plugin-premium INFO for any plugin that has a HIGH/MED finding.
     #     A contradictory "verify later" line on confirmed-bad plugins is misleading.
@@ -1556,12 +1608,12 @@ run_scan() {
     say "  INFO findings : $infoc   (context for your review)"
     say ""
     if [ "$high" -gt 0 ]; then
-        say "  --- HIGH ---"
-        awk -F'\t' '$1=="HIGH"{printf "  %-22s %s\n      %s\n", $2, $3, $4}' "$REPORT"
+        say "  --- HIGH (clustered) ---"
+        summarize_clustered "HIGH"
     fi
     if [ "$med" -gt 0 ]; then
-        say "  --- MED (first 25) ---"
-        awk -F'\t' '$1=="MED"{printf "  %-22s %s\n", $2, $3}' "$REPORT" | head -25
+        say "  --- MED (clustered) ---"
+        summarize_clustered "MED"
     fi
     say ""
     # Grouped external-request digest: one line per unique host, worst severity.

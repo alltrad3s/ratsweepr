@@ -500,7 +500,7 @@ type yaraRule struct {
 	skip     bool
 }
 
-var condComplex = regexp.MustCompile(`\bat |\bin \(|filesize|@|# |hash\.|pe\.|math\.| and .* and | or .* and |\bnot `)
+var condComplex = regexp.MustCompile(`\bat |\bin \(|filesize|@|#[a-zA-Z]|# |hash\.|pe\.|math\.|[0-9]+ of | and .* and | or .* and |\bnot `)
 
 func parseYaraRules(text string) []yaraRule {
 	var rules []yaraRule
