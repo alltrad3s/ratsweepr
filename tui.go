@@ -589,7 +589,7 @@ func (m *model) View() string {
 	var b strings.Builder
 	b.WriteString(renderBanner())
 	b.WriteString(styleDim.Render(fmt.Sprintf(
-		"  v%s · report-first · quarantine, never delete · no root\n", appVersion)))
+		"  v%s (%s) · report-first · quarantine, never delete · no root\n", appVersion, gitCommit)))
 	b.WriteString(styleDim.Render(fmt.Sprintf(
 		"  site %s · WordPress %s\n\n", m.env.WPRoot, m.env.WPVersion)))
 

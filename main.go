@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+var gitCommit = "unknown" // set via -ldflags "-X main.gitCommit=..."
+
 const usage = `RatSweepr %s — WordPress malware scanner & cleanup assistant
 
 Usage:
@@ -129,6 +131,7 @@ func main() {
 }
 
 func headlessScan(env *Env, since string) {
+	fmt.Printf("RatSweepr v%s (%s)\n", appVersion, gitCommit)
 	for _, l := range env.UpdateSignatures() {
 		fmt.Println("..", l)
 	}

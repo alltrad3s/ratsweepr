@@ -2,14 +2,15 @@
 # Requires Go 1.22+ (https://go.dev/dl or `apt install golang-go`).
 
 VERSION ?= $(shell grep 'appVersion = ' core.go | cut -d'"' -f2)
-LDFLAGS  = -s -w
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+LDFLAGS  = -s -w -X main.gitCommit=$(COMMIT)
 DIST     = dist
 
 .PHONY: build run test release checksums clean tidy
 
 ## build: compile for the current machine -> ./ratsweepr
 build:
-	go build -o ratsweepr .
+	go build -ldflags="$(LDFLAGS)" -o ratsweepr .
 
 ## run: build and launch the TUI (from a WordPress root!)
 run: build
