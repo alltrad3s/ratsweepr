@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.7.0"
+RS_VERSION="2.8.0"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -195,8 +195,6 @@ GREP|b374k_marker|b374k
 GREP|c99_marker|c99sh_|c99shell
 GREP|leaf_mailer|leafmailer|Leaf[[:space:]]PHP[[:space:]]Mailer
 GREP|move_uploaded_generic|copy[[:space:]]*\([[:space:]]*\$_FILES\[[^]]+\]\[.tmp_name.\]
-GREP|move_uploaded_file_shell|move_uploaded_file[[:space:]]*\([^)]*\$_FILES
-GREP|files_tmp_name_write|\$_FILES\[[^]]+\]\[['"'"'"]tmp_name
 GREP|gif_header_in_php_file|^GIF89a
 #
 # --- nulled-plugin behaviors (CaptainCore drift findings) ---
@@ -210,13 +208,6 @@ GREPHIGH|hides_self_unset_php|unset[[:space:]]*\([[:space:]]*\$[a-zA-Z_]+\[['"][
 GREPHIGH|hides_admin_users_prequery|add_(action|filter)[[:space:]]*\([[:space:]]*['"]pre_user_query['"]
 GREPHIGH|hides_admin_users_views|add_filter[[:space:]]*\([[:space:]]*['"]views_users['"]
 GREPHIGH|variable_function_eval|\$[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\([[:space:]]*gzinflate[[:space:]]*\([[:space:]]*base64_decode
-GREPHIGH|hmac_authed_backdoor|hash_hmac[[:space:]]*\([^)]*\$_(SERVER|POST|GET|REQUEST)
-GREPHIGH|fake_wordpress_author|Author URI:[[:space:]]*https?://wordpress.org/#
-GREPHIGH|fake_official_wp_plugin|Official WordPress plugin
-GREPHIGH|hides_from_list_table|unset[[:space:]]*\([^)]*wp_list_table->items
-GREPHIGH|hex_escaped_hook|add_(action|filter)[[:space:]]*\([[:space:]]*["'](\\x[0-9a-fA-F]{2}){3,}
-GREPHIGH|hex_escaped_hook_oct|add_(action|filter)[[:space:]]*\([[:space:]]*["'](\\[0-9]{2,3}){3,}
-GREPHIGH|large_base64_payload|base64_decode[[:space:]]*\([[:space:]]*["'][A-Za-z0-9+/]{200,}
 #
 # --- suspicious file names ---
 FNAME|hidden_ico|.*.ico
@@ -1297,6 +1288,45 @@ shuffle_salts() {
 
 # ============================ SCAN ORCHESTRATOR ===============================
 
+finalize_report() {
+    # (a) Suppress plugin-premium INFO for any plugin that has a HIGH/MED finding.
+    #     A contradictory "verify later" line on confirmed-bad plugins is misleading.
+    local flagged="$RS_CACHE/flagged.$$"
+    awk -F'\t' '($1=="HIGH"||$1=="MED") && $3 ~ /^wp-content\/plugins\// {
+        n=split($3,a,"/"); print a[3]
+    }' "$REPORT" | sort -u > "$flagged"
+
+    # (b) Collapse duplicate findings: same severity+file+signature-basename.
+    #     yara:RS_large_base64_payload and heuristic:large_base64_payload on the
+    #     same file are the same detection -> keep one (prefer yara attribution).
+    awk -F'\t' -v FLAGGED="$flagged" '
+        BEGIN { while ((getline l < FLAGGED) > 0) isflag[l]=1 }
+        {
+            sev=$1; cat=$2; item=$3; detail=$4
+            # drop contradictory plugin-premium
+            if (cat=="plugin-premium") {
+                n=split(item,a," "); slug=a[1]; sub(/^wp-content\/plugins\//,"",slug)
+                if (slug in isflag) next
+            }
+            # normalize signature basename for dedup key
+            base=cat
+            sub(/^yara:RS_/,"SIG:",base); sub(/^heuristic:/,"SIG:",base)
+            # canonicalize a few known yara<->heuristic name pairs
+            gsub(/large_base64_payload|RS_large_base64_payload/,"large_base64",base)
+            key=sev "|" item "|" base
+            if (key in seen) next
+            seen[key]=1
+            # prefer yara attribution: if we later see yara for a heuristic already
+            # printed, we cannot un-print; so we buffer instead
+            lines[NR]=$0; order[++cnt]=NR; kk[NR]=key
+        }
+        END {
+            for (i=1;i<=cnt;i++) print lines[order[i]]
+        }
+    ' "$REPORT" > "$REPORT.dedup" && mv "$REPORT.dedup" "$REPORT"
+    rm -f "$flagged"
+}
+
 run_scan() {
     banner
     : > "$REPORT"
@@ -1317,6 +1347,7 @@ run_scan() {
     scan_database
     scan_vulnerabilities
     rm -f "$PHPLIST"
+    finalize_report
 
     # ------- summary -------
     say ""

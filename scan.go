@@ -108,7 +108,46 @@ func (s *Scanner) RunAll() {
 	s.ScanHtaccess()
 	s.ScanDatabase()
 	s.ScanVulnerabilities()
+	s.finalizeReport()
 	s.WriteReport()
+}
+
+func (s *Scanner) finalizeReport() {
+	// Build set of plugins that have a HIGH/MED finding.
+	flagged := map[string]bool{}
+	for _, f := range s.Findings {
+		if (f.Sev == SevHigh || f.Sev == SevMed) && strings.HasPrefix(f.Item, "wp-content/plugins/") {
+			parts := strings.Split(f.Item, "/")
+			if len(parts) >= 3 {
+				flagged[parts[2]] = true
+			}
+		}
+	}
+	norm := func(cat string) string {
+		c := strings.TrimPrefix(cat, "yara:RS_")
+		c = strings.TrimPrefix(c, "heuristic:")
+		return strings.ToLower(c)
+	}
+	seen := map[string]bool{}
+	var out []Finding
+	for _, f := range s.Findings {
+		// drop contradictory plugin-premium on flagged plugins
+		if f.Cat == "plugin-premium" {
+			slug := strings.Fields(f.Item)[0]
+			slug = strings.TrimPrefix(slug, "wp-content/plugins/")
+			if flagged[slug] {
+				continue
+			}
+		}
+		// collapse duplicate detections (same sev+file+signature)
+		key := f.Sev + "|" + f.Item + "|" + norm(f.Cat)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	s.Findings = out
 }
 
 func (s *Scanner) WriteReport() {
