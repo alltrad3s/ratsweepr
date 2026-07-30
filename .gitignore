@@ -1,0 +1,6 @@
+# build artifacts (CI produces release binaries; don't track them)
+/dist/
+/ratsweepr
+/ratsweepr-linux-*
+/ratsweepr-darwin-*
+*.report
