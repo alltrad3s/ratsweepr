@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.3"
+RS_VERSION="2.9.5"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -719,6 +719,69 @@ rule RS_remote_content_obfuscated {
         $b64url = /base64_decode\s*\(\s*["'][A-Za-z0-9+\/]{16,}["']\s*\)/ nocase
     condition:
         (any of ($fetch1,$fetch2)) and ($dec or $b64url)
+}
+
+rule RS_header_dynamic_call_backdoor {
+    meta:
+        description = "Backdoor invoking functions from HTTP header values (getallheaders + variable-variable call)"
+        severity = "HIGH"
+    strings:
+        $gah = "getallheaders" nocase
+        $hdr = "$_HEADERS"
+        $call = /\$_HEADERS\s*\[[^\]]+\]\s*\(/
+    condition:
+        $gah and $hdr and $call
+}
+
+rule RS_cookie_dynamic_include_backdoor {
+    meta:
+        description = "Backdoor assembling function names from $_COOKIE and calling include/dynamic function"
+        severity = "HIGH"
+    strings:
+        $cook = "$_COOKIE"
+        $dyncall = /\$[a-zA-Z_][a-zA-Z0-9_]*\s*\[\s*[0-9]+\s*\]\s*\(/
+        $inc = /\b(include|require|require_once|include_once)\s*\(\s*\$/
+    condition:
+        $cook and $dyncall and $inc
+}
+
+rule RS_cookie_rot13_base64_dropper {
+    meta:
+        description = "Cookie-fed dropper: base64_decode(str_rot13($_COOKIE)) written to temp file and executed"
+        severity = "HIGH"
+    strings:
+        $chain = /base64_decode\s*\(\s*str_rot13/ nocase
+        $cook = "$_COOKIE"
+        $exec = /\b(require_once|require|include|include_once|fputs|file_put_contents)\b/ nocase
+    condition:
+        $chain and $cook and $exec
+}
+
+rule RS_header_file_dropper {
+    meta:
+        description = "Dropper writing PHP to a temp file then include+unlink (header/request triggered)"
+        severity = "HIGH"
+    strings:
+        $trig1 = "getallheaders" nocase
+        $trig2 = "$_HEADERS"
+        $write = /file_put_contents\s*\(/ nocase
+        $inc = /\b(include|require|require_once|include_once)\s*\(/ nocase
+        $del = "unlink" nocase
+    condition:
+        ($trig1 or $trig2) and $write and $inc and $del
+}
+
+rule RS_pack_obfuscated_shell {
+    meta:
+        description = "Obfuscated shell using pack('H*') to build function names, invoked dynamically from request data"
+        severity = "HIGH"
+    strings:
+        $packh = /pack\s*\(\s*['"]H\*['"]/ nocase
+        $dyncall = /\$[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\$[a-zA-Z_]/
+        $req = /\$_(POST|GET|REQUEST|COOKIE)\s*\[/
+        $evalfam = /\b(eval|assert|create_function)\s*\(/ nocase
+    condition:
+        ($packh and $evalfam) or (#packh >= 2 and $dyncall and $req)
 }
 
 RSYARA
