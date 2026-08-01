@@ -111,6 +111,7 @@ func (s *Scanner) RunAll() {
 	files := s.Env.phpishFiles()
 	s.ScanCoreVulns()
 	s.ScanCoreChecksums()
+	s.ScanCoreOrphans()
 	s.ScanPluginChecksums()
 	s.ScanUploadsPHP()
 	s.ScanHashDB(files)
@@ -194,6 +195,72 @@ func (s *Scanner) coreManifest() (map[string]string, error) {
 		return nil, fmt.Errorf("no checksum data for %s", s.Env.WPVersion)
 	}
 	return r.Checksums, nil
+}
+
+func (s *Scanner) ScanCoreOrphans() {
+	adminDir := filepath.Join(s.Env.WPRoot, "wp-admin")
+	if _, err := os.Stat(adminDir); err != nil {
+		return
+	}
+	rootOK := map[string]bool{
+		"index.php": true, "wp-activate.php": true, "wp-blog-header.php": true,
+		"wp-comments-post.php": true, "wp-config.php": true, "wp-config-sample.php": true,
+		"wp-cron.php": true, "wp-links-opml.php": true, "wp-load.php": true,
+		"wp-login.php": true, "wp-mail.php": true, "wp-settings.php": true,
+		"wp-signup.php": true, "wp-trackback.php": true, "xmlrpc.php": true,
+	}
+	already := func(rel string) bool {
+		for _, f := range s.Findings {
+			if f.Item == rel {
+				return true
+			}
+		}
+		return false
+	}
+	// webroot top-level php
+	entries, _ := os.ReadDir(s.Env.WPRoot)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".php") {
+			continue
+		}
+		if rootOK[e.Name()] {
+			continue
+		}
+		rel := e.Name()
+		if already(rel) {
+			continue
+		}
+		s.add(SevHigh, "core-orphan-file", rel, "unexpected PHP at WordPress root (not a stock core file) - review/quarantine")
+	}
+	// wp-admin / wp-includes bare-name exemptions
+	coreBare := map[string]bool{
+		"version.php": true, "functions.php": true, "general-template.php": true,
+		"link-template.php": true, "option.php": true, "options.php": true, "plugin.php": true,
+		"theme.php": true, "user.php": true, "post.php": true, "comment.php": true,
+		"category.php": true, "feed.php": true, "cron.php": true, "load.php": true,
+		"media.php": true, "meta.php": true, "nav-menu.php": true, "pluggable.php": true,
+		"rewrite.php": true, "shortcodes.php": true, "taxonomy.php": true, "template.php": true,
+		"update.php": true, "widgets.php": true, "index.php": true, "admin.php": true,
+		"menu.php": true, "about.php": true, "nav-menus.php": true, "upgrade.php": true,
+		"install.php": true,
+	}
+	for _, dir := range []string{"wp-admin", "wp-includes"} {
+		ents, _ := os.ReadDir(filepath.Join(s.Env.WPRoot, dir))
+		for _, e := range ents {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".php") {
+				continue
+			}
+			n := e.Name()
+			if strings.HasPrefix(n, "wp-") || strings.HasPrefix(n, "class-") || strings.HasPrefix(n, "ms-") || coreBare[n] {
+				continue
+			}
+			rel := dir + "/" + n
+			if already(rel) {
+				continue
+			}
+			s.add(SevMed, "core-orphan-file", rel, "unusually-named PHP in a core directory - review (core files are wp-*/class-*/ms-*)")
+		}
+	}
 }
 
 func (s *Scanner) ScanCoreChecksums() {

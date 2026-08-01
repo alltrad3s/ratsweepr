@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.5"
+RS_VERSION="2.9.6"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -380,6 +380,44 @@ scan_core_vulns() {
         ok "No known core vulnerabilities for $WPVER (core is patched)."
         info "Running post-exploitation trace sweep anyway (a patched site can still carry prior-breach traces)..."
     fi
+}
+
+# scan_core_orphans: defense-in-depth. Flags PHP files in wp-admin/wp-includes and
+# the webroot top level that are NOT part of a stock WordPress install, using a
+# built-in name allowlist. Runs even when the checksum manifest is unavailable
+# (new version, API blocked) - the case where scan_core_checksums bails early and
+# unknown-file detection would otherwise be lost. This is how a renamed file manager
+# like wp-admin/user-lust.php gets caught even with no manifest.
+scan_core_orphans() {
+    [ -d "$WPROOT/wp-admin" ] || return
+    # Known stock top-level PHP (webroot). Anything else *.php at root is suspect.
+    local root_ok="|index.php|wp-activate.php|wp-blog-header.php|wp-comments-post.php|wp-config.php|wp-config-sample.php|wp-cron.php|wp-links-opml.php|wp-load.php|wp-login.php|wp-mail.php|wp-settings.php|wp-signup.php|wp-trackback.php|xmlrpc.php|"
+    local f rel base
+    # webroot top-level php
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        case "$root_ok" in *"|$base|"*) : ;; *)
+            rel="${f#"$WPROOT"/}"
+            grep -Fq $'\tcore-unknown-file\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+            grep -Fq $'\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+            report "HIGH" "core-orphan-file" "$rel" "unexpected PHP at WordPress root (not a stock core file) - review/quarantine"
+        ;; esac
+    done < <(find "$WPROOT" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
+    # wp-admin / wp-includes: only flag files whose NAME looks out-of-place for core
+    # (core uses wp-*/class-*/ms-* plus a known set of bare names). To avoid noise we
+    # exempt the common bare core filenames and only surface genuinely odd names.
+    local core_bare="|version.php|functions.php|general-template.php|link-template.php|option.php|options.php|plugin.php|theme.php|user.php|post.php|comment.php|category.php|feed.php|cron.php|load.php|media.php|meta.php|nav-menu.php|pluggable.php|rewrite.php|shortcodes.php|taxonomy.php|template.php|update.php|widgets.php|index.php|admin.php|menu.php|about.php|nav-menus.php|upgrade.php|install.php|"
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        case "$base" in
+            wp-*|class-*|ms-*) continue;;
+        esac
+        case "$core_bare" in *"|$base|"*) continue;; esac
+        rel="${f#"$WPROOT"/}"
+        grep -Fq $'\tcore-unknown-file\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+        grep -Fq $'\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+        report "MED" "core-orphan-file" "$rel" "unusually-named PHP in a core directory - review (core files are wp-*/class-*/ms-*)"
+    done < <(find "$WPROOT/wp-admin" "$WPROOT/wp-includes" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
 }
 
 scan_core_checksums() {
@@ -782,6 +820,22 @@ rule RS_pack_obfuscated_shell {
         $evalfam = /\b(eval|assert|create_function)\s*\(/ nocase
     condition:
         ($packh and $evalfam) or (#packh >= 2 and $dyncall and $req)
+}
+
+rule RS_php_file_manager {
+    meta:
+        description = "Standalone PHP file manager (Tiny File Manager / CCP) - legit tool, but on a WordPress site it is a webshell"
+        severity = "HIGH"
+    strings:
+        $a = "Tiny File Manager" nocase
+        $b = "CCP Programmers" nocase
+        $c = "tinyfilemanager" nocase
+        $d = "H3K"
+        $e = "filemanager.php" nocase
+        $f1 = "$_FILES"
+        $f2 = /function\s+(list_dir|scan_dir|fm_get_file_path|fm_rename|fm_download)/ nocase
+    condition:
+        any of ($a,$b,$c,$d,$e) or (2 of ($f1,$f2))
 }
 
 RSYARA
@@ -1645,6 +1699,7 @@ run_scan() {
     build_php_filelist
     scan_core_vulns
     scan_core_checksums
+    scan_core_orphans
     scan_plugin_checksums
     scan_uploads_php
     scan_hashdb

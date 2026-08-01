@@ -223,3 +223,19 @@ rule RS_pack_obfuscated_shell {
     condition:
         ($packh and $evalfam) or (#packh >= 2 and $dyncall and $req)
 }
+
+rule RS_php_file_manager {
+    meta:
+        description = "Standalone PHP file manager (Tiny File Manager / CCP) - legit tool, but on a WordPress site it is a webshell"
+        severity = "HIGH"
+    strings:
+        $a = "Tiny File Manager" nocase
+        $b = "CCP Programmers" nocase
+        $c = "tinyfilemanager" nocase
+        $d = "H3K"
+        $e = "filemanager.php" nocase
+        $f1 = "$_FILES"
+        $f2 = /function\s+(list_dir|scan_dir|fm_get_file_path|fm_rename|fm_download)/ nocase
+    condition:
+        any of ($a,$b,$c,$d,$e) or (2 of ($f1,$f2))
+}
