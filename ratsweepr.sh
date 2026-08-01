@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.6"
+RS_VERSION="2.9.7"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -138,6 +138,7 @@ preflight() {
     RUNSTAMP="$(date +%Y-%m-%d_%H%M%S)"
     EXPLOIT_WINDOW_START=""
     EXPLOIT_LABEL=""
+    MANIFEST_OK=0
     DBPREFIX=""
     REPORT="$WPROOT/ratsweepr-$RUNSTAMP.report"
     LOG="$WPROOT/ratsweepr-$RUNSTAMP.log"
@@ -389,6 +390,10 @@ scan_core_vulns() {
 # unknown-file detection would otherwise be lost. This is how a renamed file manager
 # like wp-admin/user-lust.php gets caught even with no manifest.
 scan_core_orphans() {
+    # Only a FALLBACK: when the checksum manifest was available, core-unknown-file
+    # already found dropped files precisely. Running here too would flag hundreds of
+    # legit core files (our name-allowlist can never be complete). So skip if manifest ran.
+    [ "${MANIFEST_OK:-0}" = "1" ] && return
     [ -d "$WPROOT/wp-admin" ] || return
     # Known stock top-level PHP (webroot). Anything else *.php at root is suspect.
     local root_ok="|index.php|wp-activate.php|wp-blog-header.php|wp-comments-post.php|wp-config.php|wp-config-sample.php|wp-cron.php|wp-links-opml.php|wp-load.php|wp-login.php|wp-mail.php|wp-settings.php|wp-signup.php|wp-trackback.php|xmlrpc.php|"
@@ -475,6 +480,7 @@ scan_core_checksums() {
         report "HIGH" "core-unknown-file" "$extra" "file exists in core area but not in official $WPVER manifest"
     done < <(comm -13 "$expected" "$actual")
     rm -f "$expected" "$actual"
+    MANIFEST_OK=1   # unknown-file detection ran against a real manifest; orphan fallback not needed
     ok "Core verification done."
 }
 
@@ -836,6 +842,35 @@ rule RS_php_file_manager {
         $f2 = /function\s+(list_dir|scan_dir|fm_get_file_path|fm_rename|fm_download)/ nocase
     condition:
         any of ($a,$b,$c,$d,$e) or (2 of ($f1,$f2))
+}
+
+rule RS_injected_js_executor {
+    meta:
+        description = "Obfuscated client-side JS injection: atob/TextDecoder + new Function()/eval executor (drainer/spam/redirect)"
+        severity = "HIGH"
+    strings:
+        $script = "<script" nocase
+        $newfn = /new\s+Function\s*\(/ nocase
+        $atob = "atob(" nocase
+        $td = "TextDecoder" nocase
+        $charcode = "charCodeAt" nocase
+        $jseval = /\beval\s*\(\s*(atob|unescape|decodeURIComponent)/ nocase
+    condition:
+        $script and (
+            ($newfn and ($atob or $td)) or
+            $jseval or
+            ($atob and $charcode and $newfn)
+        )
+}
+
+rule RS_injected_html_comment_marker {
+    meta:
+        description = "Paired random HTML comment markers wrapping an injected <script> (mass-injection signature)"
+        severity = "MED"
+    strings:
+        $openmark = /<!--\s*[a-z]{6,12}\s*-->\s*(<\?php\s*\?>)?\s*<script/ nocase
+    condition:
+        $openmark
 }
 
 RSYARA

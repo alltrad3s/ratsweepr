@@ -239,3 +239,32 @@ rule RS_php_file_manager {
     condition:
         any of ($a,$b,$c,$d,$e) or (2 of ($f1,$f2))
 }
+
+rule RS_injected_js_executor {
+    meta:
+        description = "Obfuscated client-side JS injection: atob/TextDecoder + new Function()/eval executor (drainer/spam/redirect)"
+        severity = "HIGH"
+    strings:
+        $script = "<script" nocase
+        $newfn = /new\s+Function\s*\(/ nocase
+        $atob = "atob(" nocase
+        $td = "TextDecoder" nocase
+        $charcode = "charCodeAt" nocase
+        $jseval = /\beval\s*\(\s*(atob|unescape|decodeURIComponent)/ nocase
+    condition:
+        $script and (
+            ($newfn and ($atob or $td)) or
+            $jseval or
+            ($atob and $charcode and $newfn)
+        )
+}
+
+rule RS_injected_html_comment_marker {
+    meta:
+        description = "Paired random HTML comment markers wrapping an injected <script> (mass-injection signature)"
+        severity = "MED"
+    strings:
+        $openmark = /<!--\s*[a-z]{6,12}\s*-->\s*(<\?php\s*\?>)?\s*<script/ nocase
+    condition:
+        $openmark
+}

@@ -34,6 +34,7 @@ type Scanner struct {
 	verified map[string]bool // files byte-identical to official releases
 	exploitWindow string // disclosure date of a matched CVE, if any
 	exploitLabel  string
+	manifestOK    bool // core checksum manifest was available and compared
 }
 
 func NewScanner(e *Env, sigs *Signatures, progress func(string), found func(Finding)) *Scanner {
@@ -198,6 +199,9 @@ func (s *Scanner) coreManifest() (map[string]string, error) {
 }
 
 func (s *Scanner) ScanCoreOrphans() {
+	if s.manifestOK {
+		return // manifest handled unknown-file detection precisely; orphan fallback would be noise
+	}
 	adminDir := filepath.Join(s.Env.WPRoot, "wp-admin")
 	if _, err := os.Stat(adminDir); err != nil {
 		return
@@ -310,6 +314,7 @@ func (s *Scanner) ScanCoreChecksums() {
 			return nil
 		})
 	}
+
 	ents, _ := os.ReadDir(s.Env.WPRoot)
 	for _, en := range ents {
 		if en.IsDir() || !strings.HasSuffix(en.Name(), ".php") || en.Name() == "wp-config.php" {
@@ -320,6 +325,7 @@ func (s *Scanner) ScanCoreChecksums() {
 				"file exists in core area but not in official "+s.Env.WPVersion+" manifest")
 		}
 	}
+	s.manifestOK = true
 }
 
 // ------------------------ plugin checksum scan --------------------------------
