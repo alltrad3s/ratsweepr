@@ -268,3 +268,17 @@ rule RS_injected_html_comment_marker {
     condition:
         $openmark
 }
+
+rule RS_malicious_htaccess_lockout {
+    meta:
+        description = "Access-control malware: .htaccess denying PHP execution while whitelisting attacker shells, or blocking host-quarantined .suspected files"
+        severity = "HIGH"
+    strings:
+        $fm = "FilesMatch" nocase
+        $suspected = /\|\s*suspected\s*\)/ nocase
+        $deny = /Deny\s+from\s+all/ nocase
+        $allow = /Allow\s+from\s+all/ nocase
+        $phpmatch = /FilesMatch[^>]*\.php/ nocase
+    condition:
+        $fm and ( $suspected or ($deny and $allow and $phpmatch) )
+}

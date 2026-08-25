@@ -22,7 +22,7 @@ import (
 	_ "embed"
 )
 
-const appVersion = "3.9.7"
+const appVersion = "3.9.9"
 
 //go:embed patterns_default.conf
 var defaultPatterns string

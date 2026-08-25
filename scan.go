@@ -267,6 +267,40 @@ func (s *Scanner) ScanCoreOrphans() {
 	}
 }
 
+func (s *Scanner) classifyUnknownCoreFile(fullPath, rel string) {
+	lower := strings.ToLower(rel)
+	switch {
+	case strings.HasSuffix(lower, ".php") || strings.HasSuffix(lower, ".phtml") ||
+		strings.HasSuffix(lower, ".phar") || regexp.MustCompile(`\.php[0-9]$`).MatchString(lower):
+		s.add(SevHigh, "core-unknown-file", rel,
+			"unexpected executable PHP in core area, not in official "+s.Env.WPVersion+" manifest")
+	case strings.HasSuffix(rel, ".htaccess"):
+		// Malware tells make it HIGH: the 'suspected' extension token, or a
+		// Deny-all + Allow-specific-.php carve-out (locks out cleanup, whitelists
+		// attacker shells). Otherwise MED if it carries active rules; else silent.
+		b, err := os.ReadFile(fullPath)
+		if err != nil {
+			return
+		}
+		content := string(b)
+		suspected := regexp.MustCompile(`(?i)\|\s*suspected\s*\)`).MatchString(content)
+		denyAll := regexp.MustCompile(`(?i)Deny\s+from\s+all`).MatchString(content)
+		allowAll := regexp.MustCompile(`(?i)Allow\s+from\s+all`).MatchString(content)
+		phpMatch := regexp.MustCompile(`(?i)FilesMatch[^>]*\.php`).MatchString(content)
+		switch {
+		case suspected || (denyAll && allowAll && phpMatch):
+			s.add(SevHigh, "malicious-htaccess", rel,
+				"access-control malware: .htaccess locking out cleanup while whitelisting attacker shells (deny-all + allow-specific-php / 'suspected' token)")
+		case regexp.MustCompile(`(?i)RewriteRule|php_value|SetHandler|AddType|auto_prepend|auto_append`).MatchString(content):
+			s.add(SevMed, "core-extra-htaccess", rel,
+				"unexpected .htaccess with active rules in core area - review")
+		}
+	default:
+		s.add(SevMed, "core-extra-file", rel,
+			"unexpected non-core file in core area, not in official "+s.Env.WPVersion+" manifest - review")
+	}
+}
+
 func (s *Scanner) ScanCoreChecksums() {
 	s.progress("Verifying WordPress " + s.Env.WPVersion + " core against api.wordpress.org checksums")
 	man, err := s.coreManifest()
@@ -308,8 +342,7 @@ func (s *Scanner) ScanCoreChecksums() {
 			}
 			rel := s.Env.rel(p)
 			if !expected[filepath.ToSlash(rel)] {
-				s.add(SevHigh, "core-unknown-file", rel,
-					"file exists in core area but not in official "+s.Env.WPVersion+" manifest")
+				s.classifyUnknownCoreFile(p, rel)
 			}
 			return nil
 		})

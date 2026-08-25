@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.7"
+RS_VERSION="2.9.9"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -477,7 +477,28 @@ scan_core_checksums() {
       find . -maxdepth 1 -type f -name '*.php' ! -name 'wp-config.php' \
            | sed 's|^\./||' ) | sort -u > "$actual"
     while IFS= read -r extra; do
-        report "HIGH" "core-unknown-file" "$extra" "file exists in core area but not in official $WPVER manifest"
+        case "$extra" in
+            *.php|*.php[0-9]|*.phtml|*.phar)
+                report "HIGH" "core-unknown-file" "$extra" "unexpected executable PHP in core area, not in official $WPVER manifest";;
+            */.htaccess|.htaccess)
+                # An unexpected .htaccess in a core dir warrants inspection. Two malware
+                # tells make it HIGH: (a) the 'suspected' extension token (blocks access
+                # to host-quarantined .suspected files), and (b) a Deny-all + Allow-specific
+                # -.php carve-out (locks everyone out EXCEPT the attacker's own shells).
+                # Otherwise it's active config worth a MED review; plain/empty is silent.
+                local hcontent; hcontent="$(cat "$WPROOT/$extra" 2>/dev/null)"
+                if printf '%s' "$hcontent" | grep -qiE '\|suspected\)' \
+                   || { printf '%s' "$hcontent" | grep -qi 'Deny from all' \
+                        && printf '%s' "$hcontent" | grep -qiE 'Allow from all' \
+                        && printf '%s' "$hcontent" | grep -qiE 'FilesMatch.*\.php'; }; then
+                    report "HIGH" "malicious-htaccess" "$extra" "access-control malware: .htaccess locking out cleanup while whitelisting attacker shells (deny-all + allow-specific-php / 'suspected' token)"
+                elif printf '%s' "$hcontent" | grep -qiE 'RewriteRule|php_value|SetHandler|AddType|auto_prepend|auto_append'; then
+                    report "MED" "core-extra-htaccess" "$extra" "unexpected .htaccess with active rules in core area - review"
+                fi
+                ;;
+            *)
+                report "MED" "core-extra-file" "$extra" "unexpected non-core file in core area, not in official $WPVER manifest - review";;
+        esac
     done < <(comm -13 "$expected" "$actual")
     rm -f "$expected" "$actual"
     MANIFEST_OK=1   # unknown-file detection ran against a real manifest; orphan fallback not needed
@@ -871,6 +892,20 @@ rule RS_injected_html_comment_marker {
         $openmark = /<!--\s*[a-z]{6,12}\s*-->\s*(<\?php\s*\?>)?\s*<script/ nocase
     condition:
         $openmark
+}
+
+rule RS_malicious_htaccess_lockout {
+    meta:
+        description = "Access-control malware: .htaccess denying PHP execution while whitelisting attacker shells, or blocking host-quarantined .suspected files"
+        severity = "HIGH"
+    strings:
+        $fm = "FilesMatch" nocase
+        $suspected = /\|\s*suspected\s*\)/ nocase
+        $deny = /Deny\s+from\s+all/ nocase
+        $allow = /Allow\s+from\s+all/ nocase
+        $phpmatch = /FilesMatch[^>]*\.php/ nocase
+    condition:
+        $fm and ( $suspected or ($deny and $allow and $phpmatch) )
 }
 
 RSYARA
