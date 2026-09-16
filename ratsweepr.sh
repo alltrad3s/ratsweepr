@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.9"
+RS_VERSION="2.9.10"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.

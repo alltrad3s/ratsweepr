@@ -1,59 +1,40 @@
 #!/usr/bin/env bash
-# RatSweepr installer — downloads the right release binary, verifies its
-# checksum, and drops it in the current directory. No root required.
+# RatSweepr installer — downloads the scanner script into the current directory.
+# No root, no compilation, nothing to build. RatSweepr is a single bash script.
 #
-# Usage:
+# Usage (from your WordPress root — where wp-config.php lives):
 #   bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/install.sh)
-#   bash <(curl -sL .../install.sh) v3.0.0        # pin a specific release
+#   ./ratsweepr.sh scan
 #
-# Repo layout expected (create with `gh release create` or the web UI):
-#   Releases/<tag>/ratsweepr-linux-amd64
-#   Releases/<tag>/ratsweepr-linux-arm64
-#   Releases/<tag>/checksums.txt        <- `sha256sum ratsweepr-linux-* > checksums.txt`
+# Or skip the installer entirely and run the scanner in one line:
+#   bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/ratsweepr.sh) scan
+#
+# Pin a tag for anything unattended:
+#   .../ratsweepr/v2.9.9/ratsweepr.sh
 
 set -euo pipefail
 
-REPO="alltrad3s/ratsweepr"                    # <-- change to your GitHub user/repo
-TAG="${1:-latest}"
-
-case "$(uname -m)" in
-    x86_64|amd64)  ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    *) echo "FAIL: unsupported architecture $(uname -m)"; exit 1 ;;
-esac
-
-BIN="ratsweepr-linux-$ARCH"
-if [ "$TAG" = "latest" ]; then
-    BASE="https://github.com/$REPO/releases/latest/download"
-else
-    BASE="https://github.com/$REPO/releases/download/$TAG"
-fi
+REPO="alltrad3s/ratsweepr"
+REF="${1:-main}"                       # branch, tag, or commit
+RAW="https://raw.githubusercontent.com/$REPO/$REF/ratsweepr.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "FAIL: curl required"; exit 1; }
 
-echo ".. downloading $BIN ($TAG)"
-curl -fsSL -o ratsweepr.tmp "$BASE/$BIN"
-curl -fsSL -o ratsweepr.sums.tmp "$BASE/checksums.txt"
+echo ".. downloading ratsweepr.sh ($REF)"
+curl -fsSL -o ratsweepr.sh.tmp "$RAW"
 
-echo ".. verifying sha256"
-want="$(awk -v b="$BIN" '$2==b {print $1}' ratsweepr.sums.tmp)"
-got="$(sha256sum ratsweepr.tmp | awk '{print $1}')"
-if [ -z "$want" ] || [ "$want" != "$got" ]; then
-    rm -f ratsweepr.tmp ratsweepr.sums.tmp
-    echo "FAIL: checksum mismatch — refusing to install"; exit 1
+# sanity: make sure we got a shell script, not an error page
+if ! head -1 ratsweepr.sh.tmp | grep -q '^#!/'; then
+    rm -f ratsweepr.sh.tmp
+    echo "FAIL: downloaded file is not a script (bad ref '$REF'?)"; exit 1
 fi
-rm -f ratsweepr.sums.tmp
-
-mv ratsweepr.tmp ratsweepr
-chmod +x ratsweepr
-
-if ! ./ratsweepr help >/dev/null 2>&1; then
-    echo "WARN: binary downloaded but won't execute — this host may mount"
-    echo "      your home directory noexec. Use the bash version instead:"
-    echo "      bash <(curl -sL https://raw.githubusercontent.com/$REPO/main/ratsweepr.sh)"
-    exit 1
+if ! bash -n ratsweepr.sh.tmp 2>/dev/null; then
+    rm -f ratsweepr.sh.tmp
+    echo "FAIL: downloaded script failed syntax check — refusing to install"; exit 1
 fi
 
-echo "OK  installed ./ratsweepr ($("./ratsweepr" help 2>/dev/null | head -1 || echo ok))"
-echo "    run:  ./ratsweepr        (TUI)"
-echo "          ./ratsweepr scan   (headless)"
+mv ratsweepr.sh.tmp ratsweepr.sh
+chmod +x ratsweepr.sh
+ver="$(grep -m1 '^RS_VERSION=' ratsweepr.sh | cut -d'"' -f2)"
+echo "OK  installed ./ratsweepr.sh (v${ver:-?})"
+echo "    run:  ./ratsweepr.sh scan"
