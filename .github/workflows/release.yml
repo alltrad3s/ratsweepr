@@ -1,48 +1,38 @@
-name: release
-
-# Push a tag like v3.0.1 and this builds the binaries, generates
-# checksums.txt, and attaches everything to a GitHub Release —
-# which is exactly what install.sh downloads.
-#
-#   git tag v3.0.1 && git push origin v3.0.1
+name: ci-release
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n ratsweepr.sh
+      - name: Validate YARA ruleset compiles
+        run: |
+          ver=v1.19.0
+          url="https://github.com/VirusTotal/yara-x/releases/download/$ver/yara-x-$ver-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" | tar -xz yr && chmod +x yr
+          ./yr scan ratsweepr.yar /dev/null && echo "rules compile OK"
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Build release binaries
-        run: make release
-
+  release:
+    needs: lint
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ratsweepr-linux-amd64
-            dist/ratsweepr-linux-arm64
-            dist/ratsweepr-darwin-arm64
-            dist/checksums.txt
+            ratsweepr.sh
+            ratsweepr.yar
+            ratsweepr-sigs.conf
           generate_release_notes: true
-
-  # Sanity: every push to main must at least vet + build
-  ci:
-    if: false  # flip to `github.ref == 'refs/heads/main'` and move under on: push branches if wanted
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-      - run: make test

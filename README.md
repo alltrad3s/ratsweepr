@@ -107,7 +107,9 @@ bash <(curl -sL https://raw.githubusercontent.com/alltrad3s/ratsweepr/main/insta
    fake plugins that hide themselves from the plugin list and hide admin
    users from queries (`pre_user_query`, `views_users`).
 7. **Vulnerable core versions** — checks the detected version against a
-   known-vulnerable-core table (e.g. wp2shell / CVE-2026-63030+60137). Emits a
+   known-vulnerable-core table (e.g. wp2shell / CVE-2026-63030+60137, and
+   CVE-2026-87902 — the unauth path-traversal LFI->RCE affecting 4.7.0–7.1.1,
+   fixed in 7.1.2, exploited in the wild via PEAR pearcmd). Emits a
    HIGH finding with the CVE, the fixed version, the `wp core update` fix, and
    ready-to-paste Apache/Nginx WAF rules. The table lives in the signature
    file, so new core CVEs ship via `update-sigs` without a code change.

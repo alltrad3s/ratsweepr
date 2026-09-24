@@ -39,7 +39,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.11"
+RS_VERSION="2.9.12"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -241,6 +241,7 @@ OPTION|monsterinsights_license
 CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|6.9.0|6.9.4|6.9.5|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade|2026-07-17
 CORE_VULN|wp2shell (CVE-2026-63030+60137, unauth RCE)|7.0.0|7.0.1|7.0.2|REST API batch-route RCE chain; block /wp-json/batch/v1 if you cannot upgrade|2026-07-17
 CORE_VULN|CVE-2026-60137 (SQLi, author__not_in)|6.8.0|6.8.5|6.8.6|WP_Query SQL injection; upgrade to 6.8.6+|2026-07-17
+CORE_VULN|CVE-2026-87902 (unauth path-traversal LFI->RCE, CVSS 9.2)|4.7.0|7.1.1|7.1.2|get_page_template() includes attacker-chosen local .php via the pagename query var (RCE via PEAR pearcmd.php when register_argc_argv is on - default in official PHP Docker images and pre-8.5 cPanel). Upgrade to 7.1.2. If you cannot upgrade, block requests with double-encoded traversal (%252e%252e) in the pagename parameter at the WAF|2026-09-22
 #
 # --- external-request allowlist (ALLOWHOST|host, suffix match) ---
 ALLOWHOST|elementor.com
@@ -1328,6 +1329,28 @@ scan_database() {
     ok "Database scan done."
 }
 
+scan_cve_artifacts() {
+    # Filesystem exploitation artifacts for specific CVEs. Runs independently of
+    # DB connectivity (these are dropped files, not DB rows).
+    # CVE-2026-87902 (unauth LFI->RCE via pagename/get_page_template + PEAR pearcmd):
+    # the public exploit writes marker/webshell files with distinctive names to
+    # /tmp, /var/tmp and the webroot. These names are near-unique to the exploit.
+    local f
+    while IFS= read -r -d '' f; do
+        [ -n "$f" ] || continue
+        report "HIGH" "cve-2026-87902-artifact" "$f" \
+            "CVE-2026-87902 LFI->RCE payload dropped by the PEAR exploit - upgrade to WP 7.1.2 and remove this file"
+    done < <(find /tmp /var/tmp "$WPROOT" -maxdepth 3 -type f \
+             \( -name 'wp-pear-rce-flag.php' -o -name 'poc87902.php' \
+                -o -name 'luci_*.php' -o -name 'zeta_*.php' \) -print0 2>/dev/null | head -c 100000)
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        report "HIGH" "cve-2026-87902-marker" "${f#"$WPROOT"/}" \
+            "file contains a CVE-2026-87902 exploit marker (wp-pear-rce / cve-2026-87902 / pearcmd)"
+    done < <(grep -rliE 'wp-pear-rce|cve-2026-87902' "$WPROOT" 2>/dev/null \
+             | grep -vE 'ratsweepr\.sh$|ratsweepr\.yar$|ratsweepr-sigs\.conf$|ratsweepr-[0-9].*\.report$|patterns\.conf$|/\.ratsweepr/' | head -50)
+}
+
 scan_compromise_indicators() {
     # Post-exploitation evidence is version-INDEPENDENT: a site updated to a patched
     # version can still carry the attacker's users/posts/backdoors from when it WAS
@@ -1779,6 +1802,7 @@ run_scan() {
     scan_external_requests
     scan_htaccess
     scan_database
+    scan_cve_artifacts
     scan_compromise_indicators
     scan_vulnerabilities
     rm -f "$PHPLIST"
